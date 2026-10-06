@@ -15,8 +15,8 @@
   button,select,label.btn{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:14px;cursor:pointer}
   button.on{background:var(--accent);color:#06251a;border-color:var(--accent);font-weight:700}
   #stageWrap{display:flex;justify-content:center;background:#000;border-radius:12px;overflow:hidden;min-height:180px}
-  #stage{position:relative}
-  #stage video,#stage canvas{position:absolute;left:0;top:0;width:100%;height:100%}
+  #stage{position:relative;overflow:hidden}
+  #stage video,#stage canvas{position:absolute;left:0;top:0;width:100%;height:100%;transform-origin:50% 50%}
   #cv{touch-action:none;cursor:crosshair}
   #empty{padding:70px 16px;color:var(--sub);text-align:center;font-size:14px}
   input[type=range]{width:100%}
@@ -135,7 +135,15 @@
     <button id="anaBtn">⚡ 동작 정밀 분석</button>
     <label class="chk">원생 키 <input id="hcm" type="number" min="80" max="210" value="140"> cm</label>
   </div>
-  <div class="sub">영상 전체를 한 번 훑어 관절을 기록해요. 분석 후엔 재생이 부드럽고 속도·높이를 잴 수 있어요.</div>
+  <div class="bar">
+    <label class="chk"><input type="checkbox" id="stab" checked> 🎥 화면 흔들림 보정</label>
+    <select id="qual">
+      <option value="auto" selected>정밀도: 자동</option><option value="lite">빠름</option>
+      <option value="full">정밀</option><option value="heavy">최고 정밀 (느림)</option>
+    </select>
+  </div>
+  <div class="sub">영상 전체를 한 번 훑어 관절을 기록해요. 튀는 관절·좌우 뒤바뀜을 바로잡고, 손떨림도 같이 잡아줘요.</div>
+  <div class="sub" id="stabInfo" style="color:var(--accent)"></div>
 
   <div class="secS">✨ 발끝·손끝 궤적 추적</div>
   <div class="bar" id="trSel">
@@ -197,7 +205,9 @@ const video=$('v'), cv=$('cv'), tv=$('tv'); let ctx=cv.getContext('2d');
 const stage=$('stage'), wrap=$('stageWrap');
 const FPS=30; let AFPS=20; // 짧은 영상은 30장/초로 더 촘촘하게 분석
 const MP_WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const MODEL="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+const MB="https://storage.googleapis.com/mediapipe-models/pose_landmarker/";
+const MODELS={lite:MB+"pose_landmarker_lite/float16/1/pose_landmarker_lite.task",full:MB+"pose_landmarker_full/float16/1/pose_landmarker_full.task",heavy:MB+"pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"};
+const QN={lite:'빠름',full:'정밀',heavy:'최고 정밀'};
 
 let anns=[], tool='pen', draft=null, angPts=[];
 let poseOn=false, landmarker=null, pose=null, lastTs=0, loading=false;
@@ -206,6 +216,7 @@ let fz=null, lastT=0, skipZero=false;
 let track=null, tTrack=null, cmp=null, jstats={}, mpp=null, floorY=null;
 let analyzing=false, anaCancel=false, fileset=null, lastSG=-1;
 const trailSel=new Set();
+let trackRaw=null, trackClean=null, corr=null, stabZoom=1;
 
 const HINTS={
   pen:'화면 위를 손가락으로 그리세요.',
@@ -234,7 +245,7 @@ window.addEventListener('resize',layout);
 $('file').addEventListener('change',e=>{
   const f=e.target.files[0]; if(!f) return;
   video.src=URL.createObjectURL(f);
-  anns=[]; pose=null; fz=null; track=null; jstats={}; cmp=null; kin=null; refreshForceRep();
+  anns=[]; pose=null; fz=null; track=null; jstats={}; cmp=null; kin=null; trackRaw=null; trackClean=null; corr=null; stabZoom=1; $('stabInfo').textContent=''; refreshForceRep();
   refreshPoints(); refreshTrStats(); showReport();
 });
 video.addEventListener('loadedmetadata',()=>{
@@ -257,10 +268,14 @@ $('rate').onchange=e=>video.playbackRate=parseFloat(e.target.value);
 $('seek').oninput=e=>{ if(!video.duration) return; fz=null; video.pause(); video.currentTime=e.target.value/1000*video.duration; };
 
 /* ---------- 관절 인식 (MediaPipe) ---------- */
-async function makeLM(){
+async function makeLM(kind='lite'){
   if(!fileset) fileset=await FilesetResolver.forVisionTasks(MP_WASM);
-  return PoseLandmarker.createFromOptions(fileset,{baseOptions:{modelAssetPath:MODEL},runningMode:"VIDEO",numPoses:1});
+  const opt=dg=>({baseOptions:{modelAssetPath:MODELS[kind],delegate:dg},runningMode:"VIDEO",numPoses:1,
+    minPoseDetectionConfidence:.5,minPosePresenceConfidence:.5,minTrackingConfidence:.5});
+  try{ return await PoseLandmarker.createFromOptions(fileset,opt('GPU')); }
+  catch(e){ return PoseLandmarker.createFromOptions(fileset,opt('CPU')); }
 }
+function qualKind(d){const v=$('qual').value; return v!=='auto'?v:(d<=10?'heavy':'full');}
 async function initPose(){
   if(landmarker||loading||track) return;
   loading=true; $('status').textContent='관절 인식 모델 불러오는 중…';
@@ -276,7 +291,11 @@ function detect(){
 }
 $('poseBtn').onclick=()=>{
   poseOn=!poseOn; $('poseBtn').classList.toggle('on',poseOn);
-  if(poseOn){ if(!track) initPose(); detect(); } else if(!track) pose=null;
+  if(poseOn){
+    if(!track&&video.src&&video.duration<=20){ busyRun(()=>analyzeStudent()); } // 짧은 영상은 바로 정밀 분석
+    else if(!track) initPose();
+    detect();
+  } else if(!track) pose=null;
   render();
 };
 
@@ -514,11 +533,12 @@ function drawPip(){
 
 function paintOverlays(){
   if(track) pose=poseAt(track,video.currentTime);
-  drawTrails(); drawGhost(); drawPose(); drawForce(); drawPip(); drawScore();
+  drawTrails(); drawGhost(); drawPose(); drawForce(); ctx.save(); hud(); drawPip(); drawScore(); ctx.restore();
   anns.filter(a=>vis(a)).forEach(drawAnn);
 }
 function render(){
   if(!cv.width) return;
+  applyStabView();
   ctx.clearRect(0,0,cv.width,cv.height);
   paintOverlays();
   if(draft) drawAnn(draft);
@@ -529,16 +549,138 @@ function render(){
   }
 }
 
+/* ---------- 관절 다듬기 (튐·좌우 뒤바뀜·뼈 길이 이상 → 보정) ---------- */
+function cleanTrack(tr,W,H){
+  const n=tr.length;
+  const F=tr.map(f=>f.lm?f.lm.map(p=>({x:p.x*W,y:p.y*H,v:p.visibility??1})):null);
+  const Ls=[]; F.forEach(l=>{ if(!l||[11,12,23,24].some(i=>l[i].v<.4)) return;
+    Ls.push(Math.hypot((l[11].x+l[12].x-l[23].x-l[24].x)/2,(l[11].y+l[12].y-l[23].y-l[24].y)/2)); });
+  const L=med(Ls)||Math.min(W,H)*0.15;
+  let fixed=0;
+  // 1) 왼쪽·오른쪽 다리/팔이 한 장면만 뒤바뀌는 것 바로잡기
+  const GR=[[[25,26],[27,28],[29,30],[31,32]],[[13,14],[15,16],[17,18],[19,20],[21,22]]];
+  let prev=null;
+  for(let i=0;i<n;i++){ const l=F[i]; if(!l) continue;
+    if(prev) GR.forEach(g=>{ let d0=0,d1=0;
+      g.forEach(([a,b])=>{ d0+=Math.hypot(l[a].x-prev[a].x,l[a].y-prev[a].y)+Math.hypot(l[b].x-prev[b].x,l[b].y-prev[b].y);
+                          d1+=Math.hypot(l[a].x-prev[b].x,l[a].y-prev[b].y)+Math.hypot(l[b].x-prev[a].x,l[b].y-prev[a].y); });
+      if(d1<d0*0.55&&d0>L*0.6){ g.forEach(([a,b])=>{const t=l[a];l[a]=l[b];l[b]=t}); fixed++; } });
+    prev=l; }
+  // 2) 한 장면만 튀는 점
+  const bad=Array.from({length:n},()=>new Uint8Array(33));
+  for(let i=1;i<n-1;i++){ const a=F[i-1],l=F[i],b=F[i+1]; if(!a||!l||!b) continue;
+    for(let k=11;k<33;k++){ const px=(a[k].x+b[k].x)/2,py=(a[k].y+b[k].y)/2;
+      const dev=Math.hypot(l[k].x-px,l[k].y-py), span=Math.hypot(a[k].x-b[k].x,a[k].y-b[k].y);
+      if(dev>0.8*L&&dev>span) bad[i][k]=1; } }
+  // 3) 뼈가 갑자기 길어지는 장면 (발 모양 틀어짐의 주원인)
+  const BONES=[[23,25],[25,27],[24,26],[26,28],[27,29],[29,31],[27,31],[28,30],[30,32],[28,32],[11,13],[13,15],[12,14],[14,16]];
+  BONES.forEach(([p,q])=>{ const ls=[]; F.forEach(l=>{ if(l&&l[p].v>.5&&l[q].v>.5) ls.push(Math.hypot(l[p].x-l[q].x,l[p].y-l[q].y)); });
+    const m=med(ls); if(!m) return; const lim=(q>=29?1.9:1.45)*m;
+    F.forEach((l,i)=>{ if(l&&Math.hypot(l[p].x-l[q].x,l[p].y-l[q].y)>lim) bad[i][q]=1; }); });
+  bad.forEach(b=>b.forEach(x=>{if(x)fixed++}));
+  // 4) 틀린 점은 앞뒤 장면으로 메우기
+  const ok=(i,k)=>F[i]&&!bad[i][k]&&F[i][k].v>=.3;
+  for(let k=11;k<33;k++){ let i=0;
+    while(i<n){ if(ok(i,k)){i++;continue}
+      let j=i; while(j<n&&!ok(j,k)) j++;
+      const A=i-1,B=j;
+      if(A>=0&&B<n&&B-A-1<=8){ const pa=F[A][k],pb=F[B][k];
+        for(let q=i;q<j;q++){ if(!F[q]) continue; const w=(q-A)/(B-A); F[q][k]={x:pa.x+(pb.x-pa.x)*w,y:pa.y+(pb.y-pa.y)*w,v:Math.min(pa.v,pb.v)*.9}; } }
+      else for(let q=i;q<j;q++) if(F[q]&&bad[q][k]) F[q][k].v=Math.min(F[q][k].v,.2);
+      i=j; } }
+  // 5) 가만히 있을 때 떨림만 줄이기 (빠른 발차기는 그대로 둠)
+  const G=[1,2,3,2,1], S=F.map(l=>l&&l.map(p=>({...p})));
+  for(let i=0;i<n;i++){ const l=F[i]; if(!l) continue;
+    for(let k=0;k<33;k++){ let sx=0,sy=0,sw=0,mv=0;
+      for(let d=-2;d<=2;d++){ const m=F[i+d]; if(!m) continue; sx+=m[k].x*G[d+2]; sy+=m[k].y*G[d+2]; sw+=G[d+2];
+        if(Math.abs(d)===1) mv=Math.max(mv,Math.hypot(m[k].x-l[k].x,m[k].y-l[k].y)); }
+      const a=Math.max(0,Math.min(1,1-mv/(0.12*L)));
+      S[i][k].x=l[k].x+a*(sx/sw-l[k].x); S[i][k].y=l[k].y+a*(sy/sw-l[k].y); } }
+  const out=S.map((l,i)=>({t:tr[i].t,lm:l?l.map(p=>({x:p.x/W,y:p.y/H,visibility:p.v})):null}));
+  out.fps=tr.fps; out.kind=tr.kind; out.fixed=fixed;
+  return out;
+}
+
+/* ---------- 화면 흔들림 보정 ---------- */
+let gcv=null,gctx=null;
+function grabGray(el){
+  const w=128,h=Math.max(16,Math.round(w*el.videoHeight/el.videoWidth));
+  if(!gcv) gcv=document.createElement('canvas');
+  if(gcv.width!==w||gcv.height!==h){gcv.width=w;gcv.height=h;gctx=null}
+  if(!gctx) gctx=gcv.getContext('2d',{willReadFrequently:true});
+  gctx.drawImage(el,0,0,w,h);
+  let d; try{ d=gctx.getImageData(0,0,w,h).data; }catch(e){ return null; }
+  const g=new Float32Array(w*h); let s=0;
+  for(let i=0;i<w*h;i++){ const v=d[i*4]*.299+d[i*4+1]*.587+d[i*4+2]*.114; g[i]=v; s+=v; }
+  s/=w*h; for(let i=0;i<w*h;i++) g[i]-=s;
+  return {g,w,h};
+}
+function boxOf(r,w,h){ // 사람 영역(배경 계산에서 빼기)
+  if(!r) return null; let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  r.forEach(p=>{ if((p.visibility??1)<.2) return; x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x);y1=Math.max(y1,p.y); });
+  if(x0>x1) return null; const mx=(x1-x0)*.2+.04, my=(y1-y0)*.12+.04;
+  return {x0:Math.max(0,Math.floor((x0-mx)*w)),x1:Math.min(w-1,Math.ceil((x1+mx)*w)),y0:Math.max(0,Math.floor((y0-my)*h)),y1:Math.min(h-1,Math.ceil((y1+my)*h))};
+}
+function estShift(A,B,boxes){
+  const w=A.w,h=A.h,R=8,N=2*R+1,m=new Uint8Array(w*h);
+  boxes.forEach(b=>{ if(!b) return; for(let y=b.y0;y<=b.y1;y++) m.fill(1,y*w+b.x0,y*w+b.x1+1); });
+  const C=new Float64Array(N*N); let best=1e18,bx=0,by=0;
+  for(let dy=-R;dy<=R;dy++) for(let dx=-R;dx<=R;dx++){
+    let s=0,c=0;
+    for(let y=R;y<h-R;y+=2){ const row=y*w, row2=(y+dy)*w+dx;
+      for(let x=R;x<w-R;x+=2){ const i=row+x; if(m[i]||m[row2+x]) continue; s+=Math.abs(B.g[row2+x]-A.g[i]); c++; } }
+    const v=c>150?s/c:1e9; C[(dy+R)*N+dx+R]=v; if(v<best){best=v;bx=dx;by=dy} }
+  if(best>=1e9) return {x:0,y:0};
+  const at=(x,y)=>C[(y+R)*N+x+R]; let sx=bx,sy=by;
+  if(Math.abs(bx)<R){const l=at(bx-1,by),r=at(bx+1,by),den=l-2*best+r; if(den>0) sx+=0.5*(l-r)/den}
+  if(Math.abs(by)<R){const u=at(bx,by-1),dn=at(bx,by+1),den=u-2*best+dn; if(den>0) sy+=0.5*(u-dn)/den}
+  return {x:sx,y:sy};
+}
+function computeCorr(cam){
+  corr=null; stabZoom=1; if(!cam||cam.length<3) return;
+  const n=cam.length, W=video.videoWidth, H=video.videoHeight, sig=Math.max(2,0.5*AFPS), R=Math.ceil(3*sig);
+  const sm=cam.map((_,i)=>{ let sx=0,sy=0,sw=0;
+    for(let d=-R;d<=R;d++){ const j=i+d; if(j<0||j>=n) continue; const w=Math.exp(-d*d/(2*sig*sig)); sx+=cam[j].x*w; sy+=cam[j].y*w; sw+=w; }
+    return {x:sx/sw,y:sy/sw}; });
+  const cl=(v,m)=>Math.max(-m,Math.min(m,v));
+  corr=cam.map((o,i)=>({x:cl(o.x-sm[i].x,.12*W),y:cl(o.y-sm[i].y,.12*H)}));
+  let mx=0,my=0; corr.forEach(c=>{mx=Math.max(mx,Math.abs(c.x)/W);my=Math.max(my,Math.abs(c.y)/H)});
+  stabZoom=Math.min(1.3,1+2*Math.max(mx,my)+0.01);
+}
+function rebuildTrack(){
+  if(!trackClean){track=null;return}
+  const W=video.videoWidth,H=video.videoHeight,on=$('stab').checked&&corr;
+  track=trackClean.map((f,i)=>{ if(!f.lm||!on) return f; const c=corr[Math.min(i,corr.length-1)];
+    return {t:f.t,lm:f.lm.map(p=>({x:p.x-c.x/W,y:p.y-c.y/H,visibility:p.visibility}))}; });
+  calcStats(); refreshTrStats(); computeKin(); refreshForceRep();
+}
+function stabState(){
+  if(!corr||!$('stab').checked) return {cx:0,cy:0,z:1};
+  const n=corr.length,f=video.currentTime*AFPS,i=Math.max(0,Math.min(n-1,Math.floor(f))),j=Math.min(n-1,i+1),w=Math.max(0,Math.min(1,f-i));
+  return {cx:corr[i].x+(corr[j].x-corr[i].x)*w,cy:corr[i].y+(corr[j].y-corr[i].y)*w,z:stabZoom};
+}
+function applyStabView(){
+  const S=stabState(), k=stage.clientWidth/(video.videoWidth||1);
+  const vt=S.z===1?'':`scale(${S.z}) translate(${(-S.cx*k).toFixed(2)}px,${(-S.cy*k).toFixed(2)}px)`, ct=S.z===1?'':`scale(${S.z})`;
+  if(video.style.transform!==vt) video.style.transform=vt;
+  if(cv.style.transform!==ct) cv.style.transform=ct;
+}
+function hud(){ const z=stabState().z; if(z!==1) ctx.transform(1/z,0,0,1/z,cv.width/2*(1-1/z),cv.height/2*(1-1/z)); } // 점수판 등은 확대 안 함
+$('stab').onchange=()=>{ if(trackClean) rebuildTrack(); render(); };
+$('qual').onchange=()=>{ if(trackRaw) $('stabInfo').textContent='정밀도가 바뀌었어요. [⚡ 동작 정밀 분석]을 다시 누르면 적용돼요.'; };
+
 /* ---------- 정밀 분석 (영상 전체 관절 기록) ---------- */
 function seekTo(el,t){
   return new Promise(r=>{let done=false;const f=()=>{if(done)return;done=true;el.removeEventListener('seeked',f);r()};
     el.addEventListener('seeked',f); el.currentTime=t; setTimeout(f,1500);});
 }
 function setAna(txt,p){$('anaTxt').textContent=txt; if(p!=null)$('anaBar').style.width=Math.round(p*100)+'%'}
-async function analyze(el,name,p0,p1){
+async function analyze(el,name,p0,p1,cam){
   const d=el.duration; if(!isFinite(d)||!d) throw new Error('영상 길이를 읽을 수 없어요');
-  setAna(`${name} 준비 중…`,p0);
-  const lm=await makeLM(), out=[], n=Math.floor(d*AFPS)+1;
+  const kind=qualKind(d);
+  setAna(`${name} 준비 중… (${QN[kind]} 모델 불러오는 중)`,p0);
+  const lm=await makeLM(kind), out=[], n=Math.floor(d*AFPS)+1, offs=[];
+  let pg=null,pb=null,o={x:0,y:0};
   try{
     for(let i=0;i<n;i++){
       if(anaCancel) return null;
@@ -546,10 +688,17 @@ async function analyze(el,name,p0,p1){
       await seekTo(el,t);
       let r=null; try{ r=lm.detectForVideo(el,i*(1000/AFPS)+1).landmarks[0]||null; }catch(e){}
       out.push({t,lm:r?r.map(p=>({x:p.x,y:p.y,visibility:p.visibility??1})):null});
-      if(i%2===0) setAna(`${name} 분석 중 ${Math.round(i/n*100)}%`,p0+(p1-p0)*i/n);
+      if(cam){ // 배경이 얼마나 움직였는지 = 카메라 흔들림
+        const G=grabGray(el);
+        if(G){ const bx=boxOf(r,G.w,G.h);
+          if(pg){ const sh=estShift(pg,G,[pb,bx]); o={x:o.x+sh.x*el.videoWidth/G.w,y:o.y+sh.y*el.videoHeight/G.h}; }
+          pg=G; pb=bx; }
+        offs.push({x:o.x,y:o.y});
+      }
+      if(i%2===0) setAna(`${name} 분석 중 ${Math.round(i/n*100)}% · ${QN[kind]}`,p0+(p1-p0)*i/n);
     }
   }finally{ try{lm.close()}catch(e){} }
-  out.fps=AFPS;
+  out.fps=AFPS; out.kind=kind; out.cam=cam?offs:null;
   return out;
 }
 function poseAt(tr,t){
@@ -612,8 +761,10 @@ async function analyzeStudent(p0=0,p1=1){
   const fps=video.duration<=20?30:20;
   if(tTrack&&tTrack.fps!==fps){tTrack=null;cmp=null}
   AFPS=fps;
-  const tr=await analyze(video,'원생 영상',p0,p1); if(!tr) return;
-  track=tr; calcStats(); refreshTrStats(); computeKin(); refreshForceRep();
+  const tr=await analyze(video,'원생 영상',p0,p1,true); if(!tr) return;
+  trackRaw=tr; trackClean=cleanTrack(tr,video.videoWidth,video.videoHeight); computeCorr(tr.cam); rebuildTrack();
+  const mx=corr?Math.max(0,...corr.map(c=>Math.hypot(c.x,c.y))):0;
+  $('stabInfo').textContent=`✔ 관절 튐 ${trackClean.fixed}곳 바로잡음 · `+(mx>3?`화면 흔들림 최대 ${Math.round(mx)}px 보정`:'화면 흔들림 거의 없음')+` · ${QN[tr.kind]} 모델`;
 }
 $('anaBtn').onclick=()=>{
   if(!video.src){alert('먼저 영상을 불러오세요.');return}
@@ -693,7 +844,7 @@ function drawForce(){
       arrow(p.x*W,p.y*H,p.x*W+a.x/m*L,p.y*H+a.y/m*L,`hsl(${50-50*r},100%,60%)`,(3+3.5*r)*s);
     });
   });
-  if(chs.length) drawFlowHud(chs[0],i);
+  if(chs.length){ ctx.save(); hud(); drawFlowHud(chs[0],i); ctx.restore(); }
 }
 function drawFlowHud(c,i){
   const s=sc(), N=c.j.length, step=72*s, x0=12*s, y0=(cmp&&$('scoreOn').checked?72:12)*s, w=step*(N-1)+64*s, h=86*s;
@@ -822,7 +973,7 @@ async function runCompare(){
   await busyRun(async()=>{
     if(!track) await analyzeStudent(0,0.45);
     if(!track||anaCancel) return;
-    if(!tTrack) tTrack=await analyze(tv,'사범 영상',track?0.45:0,0.95);
+    if(!tTrack){ const r=await analyze(tv,'사범 영상',track?0.45:0,0.95); tTrack=r?cleanTrack(r,tv.videoWidth,tv.videoHeight):null; }
     if(!tTrack||anaCancel) return;
     setAna('동작 박자 자동으로 맞추는 중…',0.97); await new Promise(r=>setTimeout(r,30));
     cmp=compare();
@@ -899,7 +1050,9 @@ $('save').onclick=async()=>{
     const rate=parseFloat($('expRate').value), est=video.duration/rate+points().length*holdMs()/1000, t0=performance.now();
     await new Promise(r=>{video.onseeked=r; video.currentTime=0; setTimeout(r,800)}); video.onseeked=null;
     video.playbackRate=rate; lastT=-1;
-    const draw=()=>{ex.setTransform(k,0,0,k,0,0);ex.drawImage(video,0,0,W,H);const sv=ctx;ctx=ex;paintOverlays();ctx=sv};
+    const draw=()=>{const S=stabState();ex.setTransform(1,0,0,1,0,0);ex.fillStyle='#000';ex.fillRect(0,0,ec.width,ec.height);
+      ex.setTransform(k*S.z,0,0,k*S.z,ec.width/2*(1-S.z),ec.height/2*(1-S.z));ex.drawImage(video,-S.cx,-S.cy,W,H);
+      const sv=ctx;ctx=ex;paintOverlays();ctx=sv};
     rec.start(500);
     await video.play();
     await new Promise(done=>{
@@ -950,7 +1103,8 @@ tick();
 $('shot').onclick=()=>{
   if(!video.videoWidth) return;
   const c=document.createElement('canvas'); c.width=cv.width; c.height=cv.height;
-  const x=c.getContext('2d'); x.drawImage(video,0,0,c.width,c.height); x.drawImage(cv,0,0);
+  const x=c.getContext('2d'), S=stabState(); x.fillStyle='#000'; x.fillRect(0,0,c.width,c.height);
+  x.setTransform(S.z,0,0,S.z,c.width/2*(1-S.z),c.height/2*(1-S.z)); x.drawImage(video,-S.cx,-S.cy,c.width,c.height); x.drawImage(cv,0,0);
   c.toBlob(b=>{const a=document.createElement('a'); a.href=URL.createObjectURL(b);
     a.download='coaching_'+video.currentTime.toFixed(2)+'s.png'; a.click();},'image/png');
 };

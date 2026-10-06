@@ -6,6 +6,7 @@
 <title>동작 코칭 분석기 PRO</title>
 <style>
   :root{--bg:#0f1318;--panel:#1a2029;--line:#2c3643;--text:#e8edf3;--sub:#8b98a8;--accent:#3ddc97;}
+  [hidden]{display:none!important}
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;padding:10px;padding-bottom:40px}
   h1{font-size:17px;margin:2px 0 8px}
@@ -194,7 +195,7 @@ import {PoseLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@med
 const $ = id => document.getElementById(id);
 const video=$('v'), cv=$('cv'), tv=$('tv'); let ctx=cv.getContext('2d');
 const stage=$('stage'), wrap=$('stageWrap');
-const FPS=30, AFPS=20;
+const FPS=30; let AFPS=20; // 짧은 영상은 30장/초로 더 촘촘하게 분석
 const MP_WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
 const MODEL="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
@@ -548,6 +549,7 @@ async function analyze(el,name,p0,p1){
       if(i%2===0) setAna(`${name} 분석 중 ${Math.round(i/n*100)}%`,p0+(p1-p0)*i/n);
     }
   }finally{ try{lm.close()}catch(e){} }
+  out.fps=AFPS;
   return out;
 }
 function poseAt(tr,t){
@@ -568,10 +570,12 @@ function calcStats(){
   mpp=tm?(hcm/100*0.29)/tm:null; floorY=med(floor);
   jstats={};
   TJ.forEach(j=>{
-    const n=track.length, raw=new Float32Array(n), sp=new Float32Array(n);
-    for(let i=1;i<n;i++){const a=track[i-1].lm,b=track[i].lm; if(!a||!b) continue;
-      const pa=a[j.i],pb=b[j.i]; if(pa.visibility<.3||pb.visibility<.3) continue;
-      raw[i]=Math.hypot((pb.x-pa.x)*W,(pb.y-pa.y)*H)*AFPS;}
+    const n=track.length, raw=new Float32Array(n), sp=new Float32Array(n), G=[1,2,3,2,1];
+    const pr=track.map(f=>f.lm&&f.lm[j.i].visibility>.3?{x:f.lm[j.i].x*W,y:f.lm[j.i].y*H}:null);
+    const ps=pr.map((_,i)=>{let sx=0,sy=0,sw=0;for(let d=-2;d<=2;d++){const q=pr[i+d];if(q){sx+=q.x*G[d+2];sy+=q.y*G[d+2];sw+=G[d+2]}}return pr[i]&&sw>=4?{x:sx/sw,y:sy/sw}:null});
+    const lim=mpp?18/mpp:1e9; // 사람이 낼 수 없는 속도(18m/s 이상)는 인식 오류로 보고 버림
+    for(let i=1;i<n;i++){const pa=ps[i-1],pb=ps[i]; if(!pa||!pb) continue;
+      const v=Math.hypot(pb.x-pa.x,pb.y-pa.y)*AFPS; raw[i]=v>lim?0:v;}
     for(let i=0;i<n;i++){const q=[raw[Math.max(0,i-1)],raw[i],raw[Math.min(n-1,i+1)]].sort((x,y)=>x-y); sp[i]=q[1];} // 튀는 값 제거
     let max=0,maxI=0; sp.forEach((v,i)=>{if(v>max){max=v;maxI=i}});
     let hi=null,hiI=0;
@@ -605,6 +609,9 @@ async function busyRun(fn){
 $('anaCancel').onclick=()=>{anaCancel=true; setAna('취소하는 중…')};
 async function analyzeStudent(p0=0,p1=1){
   if(video.duration>120&&!confirm('영상이 길어서 분석에 몇 분 걸릴 수 있어요. 계속할까요?')){anaCancel=true;return}
+  const fps=video.duration<=20?30:20;
+  if(tTrack&&tTrack.fps!==fps){tTrack=null;cmp=null}
+  AFPS=fps;
   const tr=await analyze(video,'원생 영상',p0,p1); if(!tr) return;
   track=tr; calcStats(); refreshTrStats(); computeKin(); refreshForceRep();
 }

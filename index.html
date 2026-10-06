@@ -29,7 +29,10 @@
   .wsl{position:relative;flex:1;padding-bottom:9px}
   #marks i{position:absolute;bottom:0;width:6px;height:9px;margin-left:-3px;background:#ffd23f;border-radius:2px}
   .chip{display:inline-block;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:5px 9px;font-size:12px;cursor:pointer}
-  .chip b{margin-left:7px;color:#ff7b7b}
+  .chip b{margin-left:4px;color:#ff7b7b;display:inline-block;padding:2px 6px;margin-right:-6px;font-size:14px}
+  .chip .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px;border:1px solid rgba(255,255,255,.5)}
+  .chip.g{background:#2a2410;border-color:#5a4a1a;color:#ffd23f;font-weight:700}
+  .grp{display:flex;flex-wrap:wrap;gap:6px;align-items:center;width:100%;padding:6px 0;border-top:1px solid var(--line)}
   input[type=number]{width:64px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:8px;font-size:14px}
   body.busy #ctrls,body.busy #cv{pointer-events:none;opacity:.55}
   .dl{display:inline-block;background:var(--accent);color:#06251a;font-weight:700;border-radius:10px;padding:10px 14px;text-decoration:none}
@@ -107,6 +110,7 @@
   <button data-tool="circle">◯ 원</button>
   <button data-tool="angle">📐 각도기</button>
   <button data-tool="text">T 글자</button>
+  <button data-tool="erase">🧽 지우개</button>
 </div>
 
 <div class="bar">
@@ -210,6 +214,7 @@ const MODELS={lite:MB+"pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
 const QN={lite:'빠름',full:'정밀',heavy:'최고 정밀'};
 
 let anns=[], tool='pen', draft=null, angPts=[];
+let annId=0, selId=null, selTimer=null, erasing=false;
 let poseOn=false, landmarker=null, pose=null, lastTs=0, loading=false;
 let fz=null, lastT=0, skipZero=false;
 /* PRO 상태 */
@@ -225,7 +230,8 @@ const HINTS={
   arrow:'시작점에서 화살표 끝까지 드래그하세요.',
   circle:'원을 그릴 영역을 대각선으로 드래그하세요.',
   angle:'3곳을 차례로 누르세요: ①한쪽 끝 ②꼭짓점(각도가 재질 곳) ③다른 쪽 끝',
-  text:'글자를 넣을 곳을 누르세요.'
+  text:'글자를 넣을 곳을 누르세요.',
+  erase:'🧽 지울 그림을 누르거나 손가락으로 문지르세요. (실수하면 ↩ 되돌리기)'
 };
 
 /* ---------- 레이아웃 ---------- */
@@ -308,22 +314,23 @@ function setTool(t){
 document.querySelectorAll('#tools button').forEach(b=>b.onclick=()=>setTool(b.dataset.tool));
 
 const sc=()=>cv.width/720;
-function pt(e){
+function pt(e,raw){
   const r=cv.getBoundingClientRect();
   let p={x:(e.clientX-r.left)/r.width*cv.width, y:(e.clientY-r.top)/r.height*cv.height};
-  if($('snap').checked && poseOn && pose){
+  if(!raw && $('snap').checked && poseOn && pose){
     const lim=26*cv.width/r.width; let best=null,bd=lim;
     pose.forEach(l=>{const d=Math.hypot(l.x*cv.width-p.x,l.y*cv.height-p.y); if(d<bd){bd=d;best={x:l.x*cv.width,y:l.y*cv.height}}});
     if(best) p=best;
   }
   return p;
 }
-const base=()=>({color:$('color').value,w:parseFloat($('width').value),t:video.currentTime});
+const base=()=>({id:++annId,color:$('color').value,w:parseFloat($('width').value),t:video.currentTime});
 
 cv.addEventListener('pointerdown',e=>{
   if(!video.src) return;
   fz=null; video.pause();
   cv.setPointerCapture(e.pointerId);
+  if(tool==='erase'){ erasing=true; eraseAt(pt(e,true)); return; }
   const p=pt(e);
   if(tool==='text'){
     const s=prompt('입력할 글자'); if(s){anns.push({...base(),type:'text',pts:[p],text:s});}
@@ -338,13 +345,16 @@ cv.addEventListener('pointerdown',e=>{
   render();
 });
 cv.addEventListener('pointermove',e=>{
+  if(erasing){ eraseAt(pt(e,true)); return; }
   if(draft){
     const p=pt(e);
     if(tool==='pen') draft.pts.push(p); else draft.pts[1]=p;
     render();
   }
 });
+cv.addEventListener('pointercancel',()=>{erasing=false});
 cv.addEventListener('pointerup',()=>{
+  erasing=false;
   if(draft){ if(draft.pts.length>1) anns.push(draft); draft=null; changed(); }
 });
 
@@ -542,6 +552,7 @@ function render(){
   ctx.clearRect(0,0,cv.width,cv.height);
   paintOverlays();
   if(draft) drawAnn(draft);
+  if(selId!=null){ const a=anns.find(x=>x.id===selId); if(a&&vis(a)) drawSel(a); }
   if(tool==='angle'&&angPts.length){ // 진행 중 각도기 미리보기
     ctx.save(); ctx.strokeStyle=$('color').value; ctx.fillStyle=$('color').value; ctx.lineWidth=3*sc();
     ctx.beginPath(); angPts.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.stroke();
@@ -994,18 +1005,55 @@ $('tfile').onchange=async e=>{
 
 /* ---------- 프리즈(도구 쓴 지점에서 자동 정지) ---------- */
 function holdMs(){return Math.max(0.5,parseFloat($('hold').value)||10)*1000}
-function points(){const o=[];anns.map(a=>a.t).sort((a,b)=>a-b).forEach(t=>{if(!o.length||t-o[o.length-1].t>0.09)o.push({t})});return o}
+function points(){const o=[];anns.slice().sort((a,b)=>a.t-b.t).forEach(a=>{const g=o[o.length-1]; if(g&&a.t-g.t<=0.09) g.items.push(a); else o.push({t:a.t,items:[a]})});return o}
+const TN={pen:'✏️ 펜',line:'╱ 직선',dash:'┄ 점선',arrow:'➜ 화살표',circle:'◯ 원',angle:'📐 각도',text:'T 글자'};
+const esc=x=>String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function annName(a){
+  if(a.type==='text') return 'T “'+(a.text.length>6?a.text.slice(0,6)+'…':a.text)+'”';
+  if(a.type==='angle') return '📐 '+Math.round(ang(a.pts[0],a.pts[1],a.pts[2]).deg)+'°';
+  return TN[a.type]||a.type;
+}
+/* 화면에서 그림 찾기 */
+function segD(p,a,b){const dx=b.x-a.x,dy=b.y-a.y,L=dx*dx+dy*dy;let t=L?((p.x-a.x)*dx+(p.y-a.y)*dy)/L:0;t=Math.max(0,Math.min(1,t));return Math.hypot(p.x-a.x-t*dx,p.y-a.y-t*dy)}
+function annBox(a){
+  const P=a.pts;
+  if(a.type==='text'){ const z=30*sc(); ctx.save(); ctx.font=`bold ${z}px sans-serif`; const w=ctx.measureText(a.text).width; ctx.restore();
+    return {x0:P[0].x,y0:P[0].y-z,x1:P[0].x+w,y1:P[0].y+z*.3}; }
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9; P.forEach(q=>{x0=Math.min(x0,q.x);y0=Math.min(y0,q.y);x1=Math.max(x1,q.x);y1=Math.max(y1,q.y)});
+  return {x0,y0,x1,y1};
+}
+function annDist(a,p){
+  const P=a.pts;
+  if(a.type==='pen'){ if(P.length===1) return Math.hypot(p.x-P[0].x,p.y-P[0].y); let d=1e9; for(let i=1;i<P.length;i++) d=Math.min(d,segD(p,P[i-1],P[i])); return d; }
+  if(a.type==='angle') return Math.min(segD(p,P[0],P[1]),segD(p,P[1],P[2]));
+  if(a.type==='text'){ const b=annBox(a); return (p.x>=b.x0&&p.x<=b.x1&&p.y>=b.y0&&p.y<=b.y1)?0:1e9; }
+  if(a.type==='circle'){ const cx=(P[0].x+P[1].x)/2,cy=(P[0].y+P[1].y)/2,rx=Math.abs(P[1].x-P[0].x)/2||1,ry=Math.abs(P[1].y-P[0].y)/2||1;
+    const r=Math.hypot((p.x-cx)/rx,(p.y-cy)/ry); return Math.abs(r-1)*Math.min(rx,ry)*(r<1?.4:1); }
+  return segD(p,P[0],P[1]);
+}
+function hitAnn(p){ const r=cv.getBoundingClientRect(), thr=24*cv.width/r.width; let best=null,bd=thr;
+  anns.forEach(a=>{ if(!vis(a)) return; const d=annDist(a,p); if(d<bd){bd=d;best=a} }); return best; }
+function eraseAt(p){ const a=hitAnn(p); if(a){ anns=anns.filter(x=>x!==a); changed(); } }
+function drawSel(a){ const b=annBox(a),s=sc(),pd=14*s; ctx.save(); ctx.setLineDash([10*s,6*s]); ctx.lineWidth=3*s; ctx.strokeStyle='#fff';
+  ctx.shadowColor='#000'; ctx.shadowBlur=6*s; ctx.strokeRect(b.x0-pd,b.y0-pd,b.x1-b.x0+2*pd,b.y1-b.y0+2*pd); ctx.restore(); }
+function selectAnn(id){ selId=id; clearTimeout(selTimer); selTimer=setTimeout(()=>{selId=null;render()},1800); render(); }
 function changed(){refreshPoints();render()}
 function refreshPoints(){
   const P=points(),d=video.duration||1;
   $('marks').innerHTML=P.map(p=>`<i style="left:${p.t/d*100}%"></i>`).join('');
-  $('fzList').innerHTML=P.map(p=>`<span class="chip" data-t="${p.t}">⏸ ${p.t.toFixed(2)}s<b data-del="${p.t}">✕</b></span>`).join('')||'<span class="sub">그림·글자·각도기를 쓴 장면이 프리즈 지점이 됩니다.</span>';
+  $('fzList').innerHTML=P.map(p=>`<div class="grp"><span class="chip g" data-t="${p.t}">⏸ ${p.t.toFixed(2)}s</span>`
+    +p.items.map(a=>`<span class="chip" data-id="${a.id}"><i class="dot" style="background:${esc(a.color)}"></i>${esc(annName(a))}<b data-del-id="${a.id}">✕</b></span>`).join('')
+    +(p.items.length>1?`<span class="chip" data-del-group="${p.t}">🗑 이 장면 전체</span>`:'')+'</div>').join('')
+    ||'<span class="sub">그림·글자·각도기를 쓴 장면이 프리즈 지점이 됩니다.</span>';
 }
 $('fzList').onclick=e=>{
-  const c=e.target.closest('.chip'); if(!c) return;
-  const del=e.target.dataset.del, t=parseFloat(del!==undefined?del:c.dataset.t); fz=null;
-  if(del!==undefined){anns=anns.filter(a=>Math.abs(a.t-t)>=0.09);changed()}
-  else{video.pause();video.currentTime=t}
+  const T=e.target, delId=T.closest('[data-del-id]'), delG=T.closest('[data-del-group]'), item=T.closest('[data-id]'), grp=T.closest('[data-t]');
+  if(!delId&&!delG&&!item&&!grp) return; fz=null;
+  if(delId){ const id=+delId.dataset.delId; anns=anns.filter(a=>a.id!==id); changed(); return; }
+  if(delG){ const t0=+delG.dataset.delGroup, g=points().find(p=>Math.abs(p.t-t0)<1e-6);
+    if(g){ const ids=new Set(g.items.map(a=>a.id)); anns=anns.filter(a=>!ids.has(a.id)); } changed(); return; }
+  if(item){ const a=anns.find(x=>x.id===+item.dataset.id); if(a){ video.pause(); video.currentTime=a.t; selectAnn(a.id); } return; }
+  video.pause(); video.currentTime=+grp.dataset.t;
 };
 function startFreeze(p){fz={p,phase:'seek',end:0,t0:performance.now()};video.pause();video.currentTime=p.t;lastT=p.t}
 function resume(){

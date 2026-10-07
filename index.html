@@ -216,7 +216,7 @@ const QN={lite:'빠름',full:'정밀',heavy:'최고 정밀'};
 
 let anns=[], tool='pen', draft=null, angPts=[];
 let annId=0, selId=null, selTimer=null, erasing=false;
-let jdrag=null;
+let jdrag=null, lastDetT=null;
 let frameT=null; // 화면에 실제로 표시된 프레임의 시간
 const vtime=()=>(!video.paused&&frameT!=null)?frameT:video.currentTime;
 let poseOn=false, landmarker=null, pose=null, lastTs=0, loading=false;
@@ -290,13 +290,14 @@ function qualKind(d){const v=$('qual').value; return v!=='auto'?v:(d<=10?'heavy'
 async function initPose(){
   if(landmarker||loading||track) return;
   loading=true; $('status').textContent='관절 인식 모델 불러오는 중…';
-  try{ landmarker=await makeLM(); $('status').textContent=''; }
+  try{ landmarker=await makeLM('full'); $('status').textContent=''; }
   catch(err){ $('status').textContent='모델 로딩 실패(인터넷 연결 확인)'; poseOn=false; $('poseBtn').classList.remove('on'); }
   loading=false; detect(); render();
 }
 function detect(){
   if(track){ pose=poseAt(track,video.currentTime); return; }
   if(!poseOn||!landmarker||video.readyState<2||analyzing) return;
+  if(pose&&lastDetT===vtime()) return; lastDetT=vtime();
   const ts=Math.max(lastTs+1,performance.now()); lastTs=ts;
   try{ const r=landmarker.detectForVideo(video,ts); pose=liveFilter(r.landmarks[0]||null); }catch(e){}
 }
@@ -304,7 +305,7 @@ $('poseBtn').onclick=()=>{
   poseOn=!poseOn; $('poseBtn').classList.toggle('on',poseOn);
   if(poseOn){
     if(!track&&video.src&&video.duration<=20){ busyRun(()=>analyzeStudent()); } // 짧은 영상은 바로 정밀 분석
-    else if(!track) initPose();
+    else if(!track){ initPose(); $('hint').textContent='💡 지금은 빠른 실시간 표시예요. [⚡ 동작 정밀 분석]을 누르면 선이 훨씬 안정되고 정확해져요.'; }
     detect();
   } else if(!track) pose=null;
   render();
@@ -572,7 +573,7 @@ function render(){
 }
 
 /* ---------- 1€ 필터: 느린 움직임(떨림)은 강하게, 빠른 움직임은 그대로 ---------- */
-const EURO={minC:0.8,beta:1.0,dC:1.0};
+const EURO={minC:0.4,beta:1.2,dC:1.0};
 const euroA=(c,dt)=>1/(1+1/(2*Math.PI*c*dt));
 function euroStep(st,x,y,dt){ // 좌표 단위: 몸통 길이
   if(!st) return {x,y,vx:0,vy:0};
@@ -580,15 +581,16 @@ function euroStep(st,x,y,dt){ // 좌표 단위: 몸통 길이
   const a=euroA(EURO.minC+EURO.beta*Math.hypot(vx,vy),dt);
   return {x:st.x+a*(x-st.x),y:st.y+a*(y-st.y),vx,vy};
 }
-let lf=null,lfT=null,lfL=1;
+let lf=null,lfT=null,lfL=1,lfOut=null;
 function liveFilter(r){ // 분석 전 실시간 표시용
   if(!r) return r;
-  const W=video.videoWidth,H=video.videoHeight,t=video.currentTime;
-  if(!lf||lfT==null||t<=lfT||t-lfT>0.4){ const A=anchor(r.map(p=>({...p,visibility:p.visibility??1})),W,H); lfL=(A&&A.L)||H*.15; lf=null; }
+  const W=video.videoWidth,H=video.videoHeight,t=vtime();
+  if(lf&&lfOut&&Math.abs(t-lfT)<1e-4) return lfOut; // 같은 장면이면 이전 결과 그대로
+  if(!lf||lfT==null||t<lfT||t-lfT>0.4){ const A=anchor(r.map(p=>({...p,visibility:p.visibility??1})),W,H); lfL=(A&&A.L)||H*.15; lf=null; }
   const dt=lf?t-lfT:1/30; lfT=t;
   const out=r.map((p,k)=>{ const st=euroStep(lf&&lf[k],p.x*W/lfL,p.y*H/lfL,Math.max(dt,1/240)); return st; });
   lf=out;
-  return out.map((st,k)=>({x:st.x*lfL/W,y:st.y*lfL/H,visibility:r[k].visibility??1}));
+  return lfOut=out.map((st,k)=>({x:st.x*lfL/W,y:st.y*lfL/H,visibility:r[k].visibility??1}));
 }
 
 /* ---------- 관절 다듬기 (튐·좌우 뒤바뀜·뼈 길이 이상 → 보정) ---------- */
@@ -1249,7 +1251,7 @@ function tick(){
   if($('play').textContent!==pl) $('play').textContent=pl;
   const bt=(fz&&fz.phase==='hold')?`⏸ ${Math.ceil((fz.end-performance.now())/1000)}초 후 계속`:'';
   if($('badge').textContent!==bt){$('badge').textContent=bt;$('badge').hidden=!bt}
-  if(video.src&&!video.paused&&!analyzing){ detect(); if(!video.requestVideoFrameCallback) render(); }
+  if(video.src&&!video.paused&&!analyzing&&!video.requestVideoFrameCallback){ detect(); render(); }
   if(video.duration){
     $('tcur').textContent=video.currentTime.toFixed(2);
     $('seek').value=video.currentTime/video.duration*1000;
@@ -1258,7 +1260,7 @@ function tick(){
   requestAnimationFrame(tick);
 }
 tick();
-function onFrame(now,meta){ frameT=meta.mediaTime; if(!analyzing&&!video.paused) render(); video.requestVideoFrameCallback(onFrame); }
+function onFrame(now,meta){ frameT=meta.mediaTime; if(!analyzing&&!video.paused){ detect(); render(); } video.requestVideoFrameCallback(onFrame); }
 if(video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
 
 /* ---------- 이미지 저장 ---------- */

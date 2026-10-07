@@ -169,11 +169,27 @@
     <select id="forceSel">
       <option value="auto">자동 (움직이는 부위)</option>
       <option value="rf">오른발 차기</option><option value="lf">왼발 차기</option>
-      <option value="rh">오른손 지르기</option><option value="lh">왼손 지르기</option>
+      <option value="rh">오른손 지르기 (무릎→손목)</option><option value="lh">왼손 지르기 (무릎→손목)</option>
     </select>
   </div>
   <div class="sub">화살표 = 그 순간 관절에 걸리는 힘의 방향, 빛나는 선 = 힘(속도)이 몸통에서 끝으로 흘러가는 모습. 영상 움직임으로 계산한 추정치예요.</div>
   <div id="forceRep"></div>
+
+  <div class="secS">🦶 지면반력·무게중심 (추정)</div>
+  <div class="bar">
+    <label class="chk"><input type="checkbox" id="grfOn"> 지면반력·무게중심 표시</label>
+    <select id="grfDir">
+      <option value="auto">보는 방향: 자동</option><option value="r">→ 오른쪽을 봐요</option><option value="l">← 왼쪽을 봐요</option>
+    </select>
+  </div>
+  <div class="sub">🟧 주황 = 발이 몸을 앞으로 밀어주는 힘(추진) · 🟦 하늘색 = 뒤로 버티는 힘(제동) · 🟩 초록 = 아래에서 받치는 힘. 화살표 길이 = 체중의 몇 배인지, ⊕ = 무게중심. 몸 전체의 움직임에서 계산한 추정치라서 옆에서 찍은 영상일 때 가장 정확해요.</div>
+  <canvas id="grfG" style="display:none;width:100%;height:110px;border-radius:8px;background:#0a0d11;margin:4px 0;cursor:pointer"></canvas>
+  <div id="grfRep"></div>
+
+  <div class="secS">🧑‍🏫 코칭 진단 (약한 이유·연습법)</div>
+  <div class="bar"><button id="coachBtn">🔍 약한 점 진단하기</button></div>
+  <div class="sub">영상에서 센 동작(지르기·막기·차기)을 찾아 힘의 전달 순서, 땅을 미는 힘, 서기 자세를 보고 왜 약한지와 연습법을 알려줘요. 영상 한 대로 계산한 추정이라 지도자 선생님의 눈과 함께 참고해 주세요.</div>
+  <div id="coachRep"></div>
 
   <div class="secS">👨‍🏫 사범 시범과 비교</div>
   <div class="bar">
@@ -223,6 +239,7 @@ let poseOn=false, landmarker=null, pose=null, lastTs=0, loading=false;
 let fz=null, lastT=0, skipZero=false;
 /* PRO 상태 */
 let track=null, tTrack=null, cmp=null, jstats={}, mpp=null, floorY=null;
+let anaRng=null, autoBusy=false, noAuto=false, gb=null, coachRes=[], cm=null, clipTimer=null;
 let analyzing=false, anaCancel=false, fileset=null, lastSG=-1;
 const trailSel=new Set();
 let trackRaw=null, trackClean=null, corr=null, stabZoom=1;
@@ -256,7 +273,7 @@ window.addEventListener('resize',layout);
 $('file').addEventListener('change',e=>{
   const f=e.target.files[0]; if(!f) return;
   video.src=URL.createObjectURL(f);
-  anns=[]; pose=null; fz=null; track=null; jstats={}; cmp=null; kin=null; trackRaw=null; trackClean=null; corr=null; stabZoom=1; $('stabInfo').textContent=''; refreshForceRep();
+  anns=[]; pose=null; fz=null; anaRng=null; noAuto=false; gb=null; track=null; if($('coachRep')) $('coachRep').innerHTML=''; cm=null; coachRes=[]; jstats={}; cmp=null; kin=null; trackRaw=null; trackClean=null; corr=null; stabZoom=1; $('stabInfo').textContent=''; refreshForceRep();
   refreshPoints(); refreshTrStats(); showReport();
 });
 video.addEventListener('loadedmetadata',()=>{
@@ -294,19 +311,25 @@ async function initPose(){
   catch(err){ $('status').textContent='모델 로딩 실패(인터넷 연결 확인)'; poseOn=false; $('poseBtn').classList.remove('on'); }
   loading=false; detect(); render();
 }
+function autoExtend(t){ // 분석된 구간 밖으로 나가면 그 위치 기준으로 새 구간 자동 분석
+  autoBusy=true;
+  const a=Math.max(0,t-1), b=Math.min(video.duration,a+16);
+  busyRun(()=>analyzeStudent(0,1,{a,b})).finally(()=>{ if(anaCancel) noAuto=true; autoBusy=false; detect(); render(); });
+}
 function detect(){
-  if(track){ pose=poseAt(track,vtime()); if(pose||!poseOn) return; if(!landmarker){ initPose(); return; } }
+  if(track){ pose=poseAt(track,vtime()); if(pose||!poseOn) return;
+    if(anaRng&&!analyzing&&!autoBusy&&!noAuto){ const t=vtime(); if(t<anaRng.a||t>anaRng.b){ autoExtend(t); return; } } if(!landmarker){ initPose(); return; } }
   if(!poseOn||!landmarker||video.readyState<2||analyzing) return;
   if(pose&&lastDetT===vtime()) return; lastDetT=vtime();
   const ts=Math.max(lastTs+1,performance.now()); lastTs=ts;
   try{ const r=landmarker.detectForVideo(video,ts); pose=liveFilter(r.landmarks[0]||null); }catch(e){}
 }
 $('poseBtn').onclick=()=>{
-  poseOn=!poseOn; $('poseBtn').classList.toggle('on',poseOn);
+  poseOn=!poseOn; noAuto=false; $('poseBtn').classList.toggle('on',poseOn);
   if(poseOn){
     if(!track&&video.src){
       if(video.duration<=20) busyRun(()=>analyzeStudent());
-      else { const a=Math.max(0,video.currentTime-1), b=Math.min(video.duration,a+16); busyRun(()=>analyzeStudent(0,1,{a,b})); }
+      else initPose(); // 긴 영상: 사전 분석 없이 실시간 인식 → 모든 구간에서 바로 표시
     }
     detect();
   } else if(!track) pose=null;
@@ -555,7 +578,7 @@ function drawPip(){
 
 function paintOverlays(){
   if(track) pose=poseAt(track,vtime());
-  drawTrails(); drawGhost(); drawPose(); drawForce(); ctx.save(); hud(); drawPip(); drawScore(); ctx.restore();
+  drawTrails(); drawGhost(); drawPose(); drawForce(); drawGRF(); drawCoachMark(); ctx.save(); hud(); drawPip(); drawScore(); ctx.restore();
   anns.filter(a=>vis(a)).forEach(drawAnn);
 }
 function render(){
@@ -891,9 +914,10 @@ async function analyzeStudent(p0=0,p1=1,rng=null){
   if(tTrack&&tTrack.fps!==fps){tTrack=null;cmp=null}
   AFPS=fps;
   const tr=await analyze(video,'원생 영상',p0,p1,true,rng); if(!tr) return;
+  anaRng=rng;
   trackRaw=tr; trackClean=cleanTrack(tr,video.videoWidth,video.videoHeight); computeCorr(tr.cam); rebuildTrack();
   const mx=corr?Math.max(0,...corr.map(c=>Math.hypot(c.x,c.y))):0;
-  $('stabInfo').textContent=`✔ 관절 튐 ${trackClean.fixed}곳 바로잡음 · `+(mx>3?`화면 흔들림 최대 ${Math.round(mx)}px 보정`:'화면 흔들림 거의 없음')+(tr.rotPick?` · 기울어진 자세 ${tr.rotPick}장면 다시 인식`:'')+` · ${QN[tr.kind]} 모델`+(rng?` · ${rng.a.toFixed(0)}~${rng.b.toFixed(0)}초 구간 (다른 구간은 그 위치에서 관절 표시를 껐다 켜기)`:'');
+  $('stabInfo').textContent=`✔ 관절 튐 ${trackClean.fixed}곳 바로잡음 · `+(mx>3?`화면 흔들림 최대 ${Math.round(mx)}px 보정`:'화면 흔들림 거의 없음')+(tr.rotPick?` · 기울어진 자세 ${tr.rotPick}장면 다시 인식`:'')+` · ${QN[tr.kind]} 모델`+(rng?` · ${rng.a.toFixed(0)}~${rng.b.toFixed(0)}초 구간 (구간 밖으로 가면 자동으로 다시 분석해요)`:'');
 }
 $('anaBtn').onclick=()=>{
   if(!video.src){alert('먼저 영상을 불러오세요.');return}
@@ -912,17 +936,19 @@ document.querySelectorAll('#trSel button').forEach(b=>b.onclick=async()=>{
 const CHAINS=[
   {k:'rf',name:'오른발 차기',j:[24,26,28,32],n:['골반','무릎','발목','발끝']},
   {k:'lf',name:'왼발 차기',j:[23,25,27,31],n:['골반','무릎','발목','발끝']},
-  {k:'rh',name:'오른손 지르기',j:[12,14,16],n:['어깨','팔꿈치','손목']},
-  {k:'lh',name:'왼손 지르기',j:[11,13,15],n:['어깨','팔꿈치','손목']}
+  {k:'rh',name:'오른손 지르기',j:[26,33,34,12,14,16],n:['무릎','허리','상체','어깨','팔꿈치','손목']},
+  {k:'lh',name:'왼손 지르기',j:[25,33,34,11,13,15],n:['무릎','허리','상체','어깨','팔꿈치','손목']}
 ];
-const KIDX=[11,12,13,14,15,16,23,24,25,26,27,28,31,32];
+const KIDX=[11,12,13,14,15,16,23,24,25,26,27,28,31,32,33,34];
+// 33 = 허리(양쪽 엉덩이 가운데), 34 = 상체(양쪽 어깨 가운데) — 가상 관절
+function vl(P,id){ if(id===33||id===34){ const a=P[id===33?23:11],b=P[id===33?24:12]; return {x:(a.x+b.x)/2,y:(a.y+b.y)/2,visibility:Math.min(a.visibility??1,b.visibility??1)}; } return P[id]; }
 let kin=null;
 function computeKin(){
   const W=video.videoWidth,H=video.videoHeight,n=track.length,G=[1,2,3,2,1];
   kin={vel:{},acc:{},spd:{},vmax:{},amax:{},chains:[]};
   const diff=A=>A.map((_,i)=>{const a=A[i-1],b=A[i+1];return a&&b?{x:(b.x-a.x)*AFPS/2,y:(b.y-a.y)*AFPS/2}:null});
   KIDX.forEach(id=>{
-    const raw=track.map(f=>f.lm&&f.lm[id].visibility>.3?{x:f.lm[id].x*W,y:f.lm[id].y*H}:null);
+    const raw=track.map(f=>{const q=f.lm&&vl(f.lm,id); return q&&q.visibility>.3?{x:q.x*W,y:q.y*H}:null});
     const P=raw.map((_,i)=>{let sx=0,sy=0,sw=0;for(let d=-2;d<=2;d++){const p=raw[i+d];if(p){sx+=p.x*G[d+2];sy+=p.y*G[d+2];sw+=G[d+2]}}return sw>=4?{x:sx/sw,y:sy/sw}:null});
     const V=diff(P), A=diff(V), S=V.map(v=>v?Math.hypot(v.x,v.y):0);
     const am=A.map(a=>a?Math.hypot(a.x,a.y):0).filter(x=>x>0).sort((a,b)=>a-b);
@@ -933,9 +959,10 @@ function computeKin(){
     const end=c.j[c.j.length-1], S=kin.spd[end]; let iE=0; S.forEach((v,i)=>{if(v>S[iE])iE=i});
     const a=Math.max(0,iE-12), b=Math.min(n-1,iE+3);
     const peaks=c.j.map(id=>{let bi=a;for(let i=a;i<=b;i++) if(kin.spd[id][i]>kin.spd[id][bi]) bi=i; return {i:bi,v:kin.spd[id][bi]}});
-    let bad=-1; for(let q=1;q<peaks.length;q++) if(peaks[q].i<peaks[q-1].i-1){bad=q;break}
+    let bad=-1; for(let q=1;q<peaks.length;q++) if(peaks[q].i<peaks[q-1].i-1&&peaks[q-1].v>=0.2*peaks[q].v){bad=q;break}
     kin.chains.push({...c,peak:S[iE],iE,peaks,bad,amp:peaks[0].v>1?peaks[peaks.length-1].v/peaks[0].v:0});
   });
+  try{ computeBody(); }catch(e){ gb=null; console.error(e); }
 }
 function activeChains(i){
   const sel=$('forceSel').value; if(sel!=='auto') return kin.chains.filter(c=>c.k===sel);
@@ -959,7 +986,7 @@ function drawForce(){
   chs.forEach(c=>{
     ctx.save(); ctx.lineCap='round';
     for(let q=1;q<c.j.length;q++){ // 힘이 흐르는 분절 발광
-      const A=pose[c.j[q-1]],B=pose[c.j[q]]; if(A.visibility<.3||B.visibility<.3) continue;
+      const A=vl(pose,c.j[q-1]),B=vl(pose,c.j[q]); if(A.visibility<.3||B.visibility<.3) continue;
       const e=Math.min(1,kin.spd[c.j[q]][i]/kin.vmax[c.j[q]]);
       const col=`hsla(${50-50*e},100%,${55+e*15}%,${.2+e*.7})`;
       ctx.strokeStyle=col; ctx.shadowColor=col; ctx.shadowBlur=22*e*s; ctx.lineWidth=(6+e*14)*s;
@@ -967,7 +994,7 @@ function drawForce(){
     }
     ctx.restore();
     c.j.forEach(id=>{ // 힘 방향 화살표 (가속도 = 힘의 방향)
-      const a=kin.acc[id][i],p=pose[id]; if(!a||p.visibility<.3) return;
+      const a=kin.acc[id][i],p=vl(pose,id); if(!a||p.visibility<.3) return;
       const m=Math.hypot(a.x,a.y), r=Math.min(1,m/kin.amax[id]); if(r<.2||!m) return;
       const L=(25+80*r)*s;
       arrow(p.x*W,p.y*H,p.x*W+a.x/m*L,p.y*H+a.y/m*L,`hsl(${50-50*r},100%,60%)`,(3+3.5*r)*s);
@@ -992,14 +1019,18 @@ function drawFlowHud(c,i){
   ctx.restore();
 }
 function refreshForceRep(){
+  try{ refreshGrfRep(); }catch(e){ console.error(e); }
   const el=$('forceRep');
   if(!kin||!$('forceOn').checked){el.innerHTML='';return}
   let top=0; kin.chains.forEach(c=>{if(c.peak>top)top=c.peak});
   el.innerHTML=kin.chains.filter(c=>c.peak>=top*.35).sort((a,b)=>b.peak-a.peak).map(c=>{
+    const E=c.peaks[c.peaks.length-1].v, st=Math.max(0,c.peaks.findIndex(p=>p.v>=.2*E)), pk=c.peaks.slice(st);
     const seq=c.peaks.map((p,q)=>`${c.n[q]} ${(p.i/AFPS).toFixed(2)}s`).join(' → ');
     const sp=mpp?` · 끝 속도 ${(c.peak*mpp).toFixed(1)}m/s`:'';
+    const fixed=st>0?` (${c.n.slice(0,st).join('·')}은(는) 거의 고정)`:'';
+    const amp=pk[0].v>1?E/pk[0].v:0;
     const msg=c.bad<0
-      ?`✅ 힘이 ${c.n[0]}에서 ${c.n[c.n.length-1]}까지 순서대로 전달돼요 (끝에서 ${c.amp.toFixed(1)}배로 증폭)`
+      ?`✅ 힘이 ${c.n[st]}에서 ${c.n[c.n.length-1]}까지 순서대로 전달돼요${fixed}`+(amp>0&&amp<30?` (끝에서 ${amp.toFixed(1)}배로 증폭)`:'')
       :`⚠ ${c.n[c.bad]}이(가) ${c.n[c.bad-1]}보다 먼저 빨라져서 힘이 끊겨요 → ${c.n[c.bad-1]}부터 먼저 밀어 주세요`;
     return `<div class="fchip" data-t="${Math.max(0,c.peaks[0].i/AFPS-0.4)}"><b>${c.name}</b>${sp}<br>${msg}<div class="seq">${seq}</div></div>`;
   }).join('')+'<div class="sub">카드를 누르면 그 동작 직전으로 이동해요. 0.25x로 재생하면 힘이 흘러가는 게 잘 보여요.</div>';
@@ -1009,6 +1040,359 @@ $('forceOn').onchange=async()=>{
   if($('forceOn').checked&&!track&&video.src) await busyRun(()=>analyzeStudent());
   refreshForceRep(); render();
 };
+
+/* ---------- 지면반력·무게중심·발→주먹 힘 전달 (영상 추정) ---------- */
+const GRAV=9.81;
+function smoothSeries(A){const G=[1,2,3,2,1];return A.map((_,i)=>{let sx=0,sy=0,sw=0;for(let d=-2;d<=2;d++){const p=A[i+d];if(p){sx+=p.x*G[d+2];sy+=p.y*G[d+2];sw+=G[d+2]}}return sw>=4?{x:sx/sw,y:sy/sw}:null});}
+function gdir(){ const v=$('grfDir').value; return v==='r'?1:v==='l'?-1:(gb?gb.dir:1); }
+function computeBody(){
+  gb=null; if(!track||!track.length||!mpp) return;
+  const W=video.videoWidth,H=video.videoHeight,n=track.length,g=GRAV;
+  const tm=(Math.max(80,Math.min(210,parseFloat($('hcm').value)||140))/100*0.29)/mpp; // 몸통 길이(px)
+  const g1=(l,id)=>{const p=l[id]; return p&&(p.visibility??1)>.3?{x:p.x*W,y:p.y*H}:null};
+  const mid=(a,b)=>a&&b?{x:(a.x+b.x)/2,y:(a.y+b.y)/2}:null;
+  const lerp=(a,b,f)=>a&&b?{x:a.x+(b.x-a.x)*f,y:a.y+(b.y-a.y)*f}:null;
+  const SIDE=[{sh:11,el:13,wr:15,fi:19,hp:23,kn:25,an:27,to:31,he:29},{sh:12,el:14,wr:16,fi:20,hp:24,kn:26,an:28,to:32,he:30}];
+  const com=[],hipM=[],ankM=[],low=[[],[]],cp=[[],[]];
+  track.forEach(f=>{
+    const l=f.lm;
+    if(!l){ com.push(null);hipM.push(null);ankM.push(null); for(let k=0;k<2;k++){low[k].push(null);cp[k].push(null)} return; }
+    // 몸 부위별 무게(Winter 표준 비율)로 무게중심 계산
+    const parts=[[.497,lerp(mid(g1(l,11),g1(l,12)),mid(g1(l,23),g1(l,24)),.5)],[.081,mid(g1(l,7),g1(l,8))||g1(l,0)]];
+    SIDE.forEach(S=>{
+      const sh=g1(l,S.sh),el=g1(l,S.el),wr=g1(l,S.wr),fi=g1(l,S.fi),hp=g1(l,S.hp),kn=g1(l,S.kn),an=g1(l,S.an),to=g1(l,S.to);
+      parts.push([.028,lerp(sh,el,.436)],[.016,lerp(el,wr,.43)],[.006,lerp(wr,fi,.5)||wr],[.1,lerp(hp,kn,.433)],[.0465,lerp(kn,an,.433)],[.0145,lerp(an,to,.5)]);
+    });
+    let m=0,sx=0,sy=0; parts.forEach(([w,q])=>{if(q){m+=w;sx+=w*q.x;sy+=w*q.y}});
+    com.push(m>=.8?{x:sx/m,y:sy/m}:null);
+    hipM.push(mid(g1(l,23),g1(l,24))); ankM.push(mid(g1(l,27),g1(l,28)));
+    SIDE.forEach((S,k)=>{
+      const he=g1(l,S.he),to=g1(l,S.to),an=g1(l,S.an), pts=[he,to].filter(Boolean);
+      if(pts.length){ low[k].push({x:0,y:Math.max(...pts.map(q=>q.y))}); cp[k].push(pts.length===2?mid(pts[0],pts[1]):pts[0]); }
+      else if(an){ low[k].push({x:0,y:an.y+.2*tm}); cp[k].push({x:an.x,y:an.y+.2*tm}); }
+      else { low[k].push(null); cp[k].push(null); }
+    });
+  });
+  const comS=smoothSeries(smoothSeries(com));
+  const kk=AFPS*AFPS/4;
+  const acc=comS.map((_,i)=>{const a=comS[i-2],b=comS[i],c=comS[i+2]; if(!a||!b||!c) return null;
+    return {x:(c.x-2*b.x+a.x)*mpp*kk, y:-(c.y-2*b.y+a.y)*mpp*kk};}); // y: 위쪽이 +
+  const lowS=low.map(smoothSeries);
+  // 지면 높이: 앞뒤 1초 동안 가장 낮은 발 위치 (카메라 쪽으로 걸어와도 따라가도록)
+  const lowAll=lowS[0].map((a,i)=>{const b=lowS[1][i]; return a&&b?Math.max(a.y,b.y):(a?a.y:(b?b.y:null))});
+  const fl=lowAll.map((_,i)=>{let m=-1e9; for(let j=Math.max(0,i-AFPS);j<=Math.min(n-1,i+AFPS);j++) if(lowAll[j]!=null&&lowAll[j]>m) m=lowAll[j]; return m});
+  const tol=.15*tm;
+  const F=[], pelRaw=[];
+  for(let i=0;i<n;i++){
+    const c=comS[i], a=acc[i];
+    pelRaw.push(hipM[i]&&ankM[i]?{x:(hipM[i].x-ankM[i].x)*mpp,y:0}:null);
+    if(!c||!a){ F.push(null); continue; }
+    const tot={fx:a.x/g, fy:Math.max(0,(a.y+g)/g)}; // 체중(BW) 단위. x: 오른쪽 +, y: 위 +
+    const gr=[0,1].map(k=>{
+      const L=lowS[k][i],P=cp[k][i],L0=lowS[k][i-1],L1=lowS[k][i+1]; if(!L||!P) return false;
+      const vy=(L0&&L1)?(L1.y-L0.y)*AFPS/2*mpp:0;
+      return L.y>=fl[i]-tol && Math.abs(vy)<.7;
+    });
+    const ft=[null,null], on=[0,1].filter(k=>gr[k]);
+    const pt=k=>({x:cp[k][i].x*mpp,y:-cp[k][i].y*mpp}), C={x:c.x*mpp,y:-c.y*mpp};
+    if(on.length===1){ ft[on[0]]={fx:tot.fx,fy:tot.fy}; }
+    else if(on.length===2){
+      // 두 발의 힘은 각각 "발 → 무게중심" 방향으로 걸린다고 보고 합력에 맞춰 나눔
+      // → 무게중심 앞쪽 발은 뒤로 버티고(제동), 뒤쪽 발은 앞으로 밀어줘요(추진)
+      const A=pt(0),B=pt(1), da=Math.hypot(C.x-A.x,C.y-A.y), db=Math.hypot(C.x-B.x,C.y-B.y);
+      let done=false;
+      if(da>.05&&db>.05){
+        const ua={x:(C.x-A.x)/da,y:(C.y-A.y)/da}, ub={x:(C.x-B.x)/db,y:(C.y-B.y)/db};
+        const det=ua.x*ub.y-ub.x*ua.y;
+        if(Math.abs(det)>.2){
+          const Na=(tot.fx*ub.y-ub.x*tot.fy)/det, Nb=(ua.x*tot.fy-tot.fx*ua.y)/det;
+          if(Na>=-.02&&Nb>=-.02){ ft[0]={fx:Na*ua.x,fy:Na*ua.y}; ft[1]={fx:Nb*ub.x,fy:Nb*ub.y}; done=true; }
+        }
+      }
+      if(!done){ const dx=A.x-B.x, sh=Math.abs(dx)>.05?Math.max(0,Math.min(1,(C.x-B.x)/dx)):.5;
+        ft[0]={fx:tot.fx*sh,fy:tot.fy*sh}; ft[1]={fx:tot.fx*(1-sh),fy:tot.fy*(1-sh)}; }
+    }
+    F.push({cx:c.x/W,cy:c.y/H,tx:tot.fx,ty:tot.fy,
+      ft:ft.map((q,k)=>q?{x:cp[k][i].x/W,y:cp[k][i].y/H,fx:q.fx,fy:q.fy}:null)});
+  }
+  const pel=smoothSeries(smoothSeries(pelRaw)).map(q=>q?q.x:null);
+  let dir=1; try{ const fc=facing(track,W,H,false); if(Math.abs(fc.nose)>.05) dir=Math.sign(fc.nose); }catch(e){}
+  gb={f:F,pel,dir,n};
+}
+function grfAt(){ if(!gb) return -1; return Math.max(0,Math.min(gb.n-1,Math.round(vtime()*AFPS))); }
+function drawGRF(){
+  if(!gb||!track||!$('grfOn').checked) return;
+  const i=grfAt(), q=gb.f[i]; drawGrfGraph(i); if(!q) return;
+  const W=cv.width,H=cv.height,s=sc(),d=gdir();
+  const colOf=fx=>fx*d>.1?'#ff9f43':fx*d<-.1?'#3ec6ff':'#7be07b';
+  const feet=[0,1].filter(k=>q.ft[k]);
+  const frontK=feet.length===2?(q.ft[0].x*d>q.ft[1].x*d?0:1):-1;
+  ctx.save();
+  feet.forEach(k=>{
+    const f=q.ft[k], mag=Math.hypot(f.fx,f.fy); if(mag<.05) return;
+    const L=Math.min(3.2,mag)*95*s, x1=f.x*W, y1=f.y*H, x2=x1+f.fx/mag*L, y2=y1-f.fy/mag*L, col=colOf(f.fx);
+    arrow(x1,y1,x2,y2,col,(3.5+Math.min(3,mag)*1.6)*s);
+    const role=f.fx*d>.1?'앞으로 진행':f.fx*d<-.1?'뒤로 버팀':'받치는 힘';
+    const nm=feet.length===2?(k===frontK?'앞발':'뒷발'):'지지발';
+    ctx.font=`bold ${13*s}px sans-serif`; ctx.textAlign='center'; ctx.lineWidth=4*s; ctx.strokeStyle='rgba(0,0,0,.8)'; ctx.fillStyle=col;
+    const tx=x2, ty=y2-8*s, t=`${nm} ${role} ${mag.toFixed(1)}`; ctx.strokeText(t,tx,ty); ctx.fillText(t,tx,ty);
+  });
+  // 무게중심 ⊕
+  const cx=q.cx*W, cy=q.cy*H, r=9*s;
+  ctx.shadowColor='rgba(0,0,0,.8)'; ctx.shadowBlur=6*s;
+  ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(cx,cy,r,0,7); ctx.fill();
+  ctx.fillStyle='#111'; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,0,Math.PI/2); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,Math.PI,Math.PI*1.5); ctx.fill();
+  ctx.restore();
+  // 합계 HUD (왼쪽 아래)
+  ctx.save(); hud();
+  const air=!feet.length, h=q.tx*d;
+  const lines=air?['🦘 발이 떠 있어요 (공중)']:[`지면반력 합: 위 ${q.ty.toFixed(2)} · ${h>=0?'앞':'뒤'} ${Math.abs(h).toFixed(2)} (체중 배)`];
+  const pv=gb.pel[i]; if(pv!=null){ const p0=gb.pel.find(v=>v!=null); lines.push(`허리 위치(발 기준) ${(pv*d*100).toFixed(0)}cm`); }
+  ctx.font=`bold ${14*s}px sans-serif`; ctx.textAlign='left';
+  const w=Math.max(...lines.map(t=>ctx.measureText(t).width))+20*s, hh=lines.length*20*s+10*s, x0=12*s, y0=H-hh-12*s;
+  ctx.fillStyle='rgba(0,0,0,.62)'; ctx.beginPath(); ctx.roundRect?ctx.roundRect(x0,y0,w,hh,10*s):ctx.rect(x0,y0,w,hh); ctx.fill();
+  ctx.fillStyle='#fff'; lines.forEach((t,j)=>ctx.fillText(t,x0+10*s,y0+22*s+j*20*s));
+  ctx.restore();
+}
+function drawGrfGraph(i){
+  const c=$('grfG'); if(!gb||!$('grfOn').checked){ c.style.display='none'; return; }
+  c.style.display='block'; if(c.width!==720){ c.width=720; c.height=110; }
+  const g=c.getContext('2d'), w=720, h=110, n=gb.n, d=gdir();
+  g.clearRect(0,0,w,h);
+  let mx=1.5,mn=-.5; gb.f.forEach(q=>{ if(!q||!(q.ft[0]||q.ft[1])) return; mx=Math.max(mx,q.ty); mn=Math.min(mn,q.tx*d); mx=Math.max(mx,q.tx*d); });
+  mx+=.2; mn-=.1;
+  const X=k=>k/(n-1)*w, Y=v=>h-6-(v-mn)/(mx-mn)*(h-14);
+  g.strokeStyle='rgba(255,255,255,.25)'; g.lineWidth=1; g.setLineDash([4,4]);
+  [0,1].forEach(v=>{ g.beginPath(); g.moveTo(0,Y(v)); g.lineTo(w,Y(v)); g.stroke(); }); g.setLineDash([]);
+  const line=(fn,col)=>{ g.strokeStyle=col; g.lineWidth=2; g.beginPath(); let pen=false;
+    gb.f.forEach((q,k)=>{ const v=q&&(q.ft[0]||q.ft[1])?fn(q):null; if(v==null){pen=false;return} if(!pen){g.moveTo(X(k),Y(v));pen=true}else g.lineTo(X(k),Y(v)); }); g.stroke(); };
+  line(q=>q.ty,'#5cd68a'); line(q=>q.tx*d,'#ff9f43');
+  g.font='11px sans-serif'; g.fillStyle='#5cd68a'; g.fillText('위(받침) 1=체중',6,12); g.fillStyle='#ff9f43'; g.fillText('앞(+) / 뒤(−)',130,12);
+  g.fillStyle='rgba(255,255,255,.5)'; g.fillText('0',w-12,Y(0)-3);
+  g.strokeStyle='#fff'; g.lineWidth=2; g.beginPath(); g.moveTo(X(i),0); g.lineTo(X(i),h); g.stroke();
+}
+$('grfG').onclick=e=>{ if(!gb) return; const r=$('grfG').getBoundingClientRect(); fz=null; video.pause(); video.currentTime=Math.max(0,(e.clientX-r.left)/r.width*(gb.n-1)/AFPS); };
+function refreshGrfRep(){
+  const el=$('grfRep');
+  if(!gb||!kin||!$('grfOn').checked){ el.innerHTML=''; $('grfG').style.display='none'; return; }
+  const d=gdir(), F=gb.f, AF=AFPS, gr=q=>q&&(q.ft[0]||q.ft[1]);
+  let up={v:0,i:0},fw={v:0,i:0},bk={v:0,i:0};
+  F.forEach((q,i)=>{ if(!gr(q)) return; if(q.ty>up.v) up={v:q.ty,i}; const h=q.tx*d; if(h>fw.v) fw={v:h,i}; if(-h>bk.v) bk={v:-h,i}; });
+  const T=i=>(i/AF).toFixed(2)+'초', link=i=>`data-t="${Math.max(0,i/AF-.15)}"`;
+  let html=`<div class="fchip" ${link(up.i)}><b>📈 지면반력 요약</b><br>`
+    +`가장 세게 받친 순간 ${up.v.toFixed(2)}배 (${T(up.i)}) · 앞으로 가장 세게 민 순간 ${fw.v.toFixed(2)}배 (${T(fw.i)}) · 뒤로 가장 세게 버틴 순간 ${bk.v.toFixed(2)}배 (${T(bk.i)})`
+    +`<div class="seq">1배 = 내 체중. 서 있으면 1배, 점프하면 2배 이상, 공중에선 0이에요.</div></div>`;
+  const top=kin.chains.slice().sort((a,b)=>b.peak-a.peak)[0];
+  if(top){
+    const iE=top.iE; let best=-1,bv=0;
+    for(let i=Math.max(0,iE-Math.round(AF*.6));i<=iE;i++){ const q=F[i]; if(gr(q)&&Math.abs(q.tx)>bv){bv=Math.abs(q.tx);best=i} }
+    if(best<0) best=Math.max(0,iE-Math.round(AF*.2));
+    const q=F[best];
+    if(gr(q)){
+      const ks=[0,1].filter(k=>q.ft[k]), fK=ks.length===2?(q.ft[0].x*d>q.ft[1].x*d?0:1):-1;
+      const row=k=>{ const f=q.ft[k], m=Math.hypot(f.fx,f.fy), h=f.fx*d;
+        const nm=ks.length===2?(k===fK?'앞발':'뒷발'):'지지발';
+        const what=h>.1?`앞으로 ${h.toFixed(2)}만큼 몸을 밀어 진행시켜요`:h<-.1?`뒤로 ${(-h).toFixed(2)}만큼 버텨요 (제동)`:'주로 아래에서 받쳐요';
+        return `${nm}: 위 ${f.fy.toFixed(2)} · ${what}`; };
+      html+=`<div class="fchip" ${link(best)}><b>🦶 ${top.name} 순간의 발 (${T(best)})</b><br>${ks.map(row).join('<br>')}<div class="seq">숫자는 체중의 몇 배인지예요. 주먹이 나가기 직전 0.6초 안에서 가장 센 순간이에요.</div></div>`;
+    }
+    // 허리(골반) 앞뒤 움직임
+    const a=Math.max(0,iE-Math.round(AF*.7)), b=Math.min(gb.n-1,iE+Math.round(AF*.5));
+    let v0=null; for(let i=a;i<=b;i++) if(gb.pel[i]!=null){v0=gb.pel[i]*d;break}
+    if(v0!=null){
+      let mxv=-1e9,mi=a; for(let i=a;i<=b;i++) if(gb.pel[i]!=null&&gb.pel[i]*d>mxv){mxv=gb.pel[i]*d;mi=i}
+      let mnv=1e9; for(let i=mi;i<=b;i++) if(gb.pel[i]!=null&&gb.pel[i]*d<mnv) mnv=gb.pel[i]*d;
+      const fwd=(mxv-v0)*100, back=(mxv-mnv)*100;
+      if(fwd>1.5) html+=`<div class="fchip" ${link(mi)}><b>🔄 허리 앞뒤 움직임</b><br>발 기준으로 허리가 앞으로 ${fwd.toFixed(0)}cm 나갔다가(${T(mi)})${back>1.5?` ${back.toFixed(0)}cm 되돌아와요`:' 그대로 있어요'}</div>`;
+      else html+=`<div class="fchip"><b>🔄 허리 앞뒤 움직임</b><br>허리는 발 위에서 거의 앞뒤로 안 움직였어요 (${fwd.toFixed(0)}cm)</div>`;
+    }
+  }
+  el.innerHTML=html+'<div class="sub">카드를 누르면 그 순간으로 이동해요. 그래프를 눌러도 이동해요.</div>';
+  drawGrfGraph(grfAt());
+}
+$('grfRep').onclick=e=>{const c=e.target.closest('.fchip'); if(!c||!c.dataset.t) return; fz=null; video.pause(); video.currentTime=parseFloat(c.dataset.t);};
+$('grfOn').onchange=async()=>{
+  if($('grfOn').checked&&!track&&video.src) await busyRun(()=>analyzeStudent());
+  refreshGrfRep(); render();
+};
+$('grfDir').onchange=()=>{ refreshGrfRep(); render(); };
+/* end grf */
+
+/* ---------- 코칭 진단: 왜 약한지 + 연습법 ---------- */
+const COACH={
+  order:{why:'힘은 발 → 허리 → 어깨 → 팔 순서로 올라가야 커져요. 지금은 팔·다리 끝이 먼저 나가서 아래에서 올라오는 힘이 중간에서 끊겨요.',
+    fix:['아주 천천히(한 동작 4초) 하면서 "발로 땅 밀기 → 허리 → 어깨 → 주먹" 순서를 입으로 말하며 연습','0.25배속으로 다시 재생해서 힘의 흐름 선이 아래에서 위로 가는지 확인','처음엔 팔 힘을 완전히 빼고 몸통만 돌려 보고, 팔은 마지막에 튕겨 나가게 하기']},
+  lower:{why:'팔·어깨 근육은 작아서 다리와 허리의 힘을 빌려야 세져요. 지금은 하체·허리가 거의 안 움직이고 팔로만 하고 있어요.',
+    fix:['뒷발바닥으로 바닥을 비틀어 밀면서 지르기·막기','허리에 손을 얹고 허리가 먼저 도는지 느끼며 천천히 반복','스쿼트로 내려갔다가 일어나면서 지르기 (다리 펴는 힘의 타이밍 익히기)']},
+  amp:{why:'힘이 몸에서 손끝으로 갈수록 점점 빨라져야(채찍처럼) 센데, 중간에서 속도가 안 붙어요.',
+    fix:['수건 끝을 잡고 채찍처럼 휘둘러 몸통→팔→손 순서의 느낌 익히기','팔꿈치는 몸 가까이서 출발하고 끝에서만 쭉 펴기','가벼운 고무밴드를 허리에 걸고 허리를 먼저 돌린 뒤 팔 뻗기']},
+  stop:{why:'동작 끝에서 몸이 "탁" 멈춰야 힘이 상대에게 전달돼요. 끝에서도 계속 흘러가면 힘이 밖으로 새요.',
+    fix:['끝 동작에서 1초 멈추고 균형이 흔들리는지 확인','끝나는 순간에만 주먹을 꽉 쥐고 몸통·엉덩이를 단단히 조이기 (긴장-이완 연습)','미트나 종이를 매달아 "맞히고 멈추기" 연습']},
+  noground:{why:'땅을 밀지 않으면 몸통과 팔이 힘을 받을 곳이 없어요. 앞뒤로 땅을 미는 힘이 거의 보이지 않아요.',
+    fix:['뒷발로 바닥을 뒤로 쓸어내듯 밀면서 지르기','벽에 손을 대고 뒷발로 벽을 밀듯 체중을 앞으로 보내기','한 걸음 이동하며 지르기로 체중 이동 느낌 익히기']},
+  rear:{why:'뒷발이 앞으로 밀어주는 힘이 약해서 몸 전체의 힘이 앞으로 잘 안 나가요.',
+    fix:['뒷발바닥 전체로 바닥을 누르고 뒷무릎을 펴면서 앞으로 보내기','런지 자세에서 뒷발로 밀어 일어나기 10회']},
+  brake:{why:'앞발이 뒤로 버텨 주지 못하면 몸이 앞으로 쏠리면서 힘이 땅으로 빠져나가요.',
+    fix:['지르기 끝에서 앞발로 버티며 1초 정지 (앞무릎이 발끝을 넘지 않게)','앞발 아래에 종이를 깔고 끝까지 밀리지 않게 버티기']},
+  pelvis:{why:'허리가 앞으로 많이 밀려 나가면 중심이 앞발 밖으로 빠져 균형이 무너지고, 되돌아오는 데도 힘이 낭비돼요.',
+    fix:['거울로 머리 위치를 보며 지르기 (머리가 앞으로 안 나가게)','엉덩이를 살짝 뒤로 당긴다는 느낌으로 서기를 유지']},
+  widthN:{why:'서기가 좁으면 땅을 밀 받침이 작아서 흔들리고 힘을 쓰기 어려워요. (서기 종류에 따라 기준은 달라져요)',
+    fix:['바닥에 테이프로 발 위치를 표시하고 같은 폭으로 반복','서기 자세로 10초 버티기 × 3세트']},
+  widthW:{why:'서기가 너무 넓으면 다리가 펴져서 땅을 누르기 힘들고 이동이 느려져요. (서기 종류에 따라 기준은 달라져요)',
+    fix:['발 위치를 한 뼘 줄여 보고 무릎이 굽혀지는지 확인','바닥 테이프로 정확한 서기 폭 표시해서 반복']},
+  knee:{why:'무릎이 거의 펴져 있으면 서기가 높아서 땅을 누르는 힘을 못 쓰고 뒤에서 밀려요.',
+    fix:['벽 스쿼트 10초 × 3세트','서기 자세에서 앞무릎을 발끝 방향으로 굽히고 5초 버티기']},
+  lean:{why:'상체가 기울면 몸의 중심이 발 위에서 벗어나 힘이 줄고 균형이 흔들려요.',
+    fix:['머리 위에 수건이나 책을 올리고 서기·지르기 해 보기','옆모습 영상에서 어깨-엉덩이-발이 일직선인지 확인']},
+  sway:{why:'중심이 크게 흔들리면 땅에서 받은 힘이 몸통으로 전달되기 전에 새 버려요.',
+    fix:['한 발 서기 5초 × 3세트로 균형 키우기','느린 동작으로 중심이 위아래·앞뒤로 튀지 않게 연습']}
+};
+function coachEvents(){
+  const n=track.length, AF=AFPS, gap=Math.round(.8*AF), ev=[]; let gM=0;
+  kin.chains.forEach(c=>{ gM=Math.max(gM,kin.vmax[c.j[c.j.length-1]]); });
+  kin.chains.forEach(c=>{
+    const e=c.j[c.j.length-1], S=kin.spd[e], th=Math.max(.45*kin.vmax[e],.3*gM);
+    for(let i=2;i<n-2;i++) if(S[i]>=th&&S[i]>=S[i-1]&&S[i]>=S[i+1]&&S[i]>=S[i-2]&&S[i]>=S[i+2]) ev.push({c,i,v:S[i]});
+  });
+  ev.sort((a,b)=>b.v-a.v);
+  const pick=[]; ev.forEach(e=>{ if(pick.length<4&&pick.every(p=>Math.abs(p.i-e.i)>=gap)) pick.push(e); });
+  return pick.sort((a,b)=>a.i-b.i);
+}
+function diagEvent(ev){
+  const {c,i:iE}=ev, W=video.videoWidth,H=video.videoHeight,AF=AFPS,n=track.length,d=gdir(),F=[];
+  const hand=c.k==='rh'||c.k==='lh';
+  const R=(a,b)=>{const x=[];for(let k=Math.max(0,a);k<=Math.min(n-1,b);k++)x.push(k);return x};
+  const P=(i,id)=>{const l=track[i]&&track[i].lm; if(!l) return null; const q=vl(l,id); return q&&q.visibility>.3?{x:q.x*W,y:q.y*H}:null};
+  const add=(lv,key,title,extra,o)=>F.push({lv,key,title,extra:extra||'',t:(o&&o.t!=null?o.t:iE/AF),marks:(o&&o.marks)||[]});
+  const endId=c.j[c.j.length-1];
+  let kind=c.name;
+  if(hand){ const side=c.k==='rh'?[12,14,16]:[11,13,15], A=P(iE,side[0]),B=P(iE,side[1]),C=P(iE,side[2]);
+    if(A&&B&&C){ const deg=ang(A,B,C).deg; kind=(c.k==='rh'?'오른팔 ':'왼팔 ')+(deg>=150?'지르기·뻗기':'막기·접은 팔')+` (팔꿈치 ${Math.round(deg)}°)`; } }
+  // 1) 힘 전달 순서
+  const E=c.peaks[c.peaks.length-1].v, st=Math.max(0,c.peaks.findIndex(p=>p.v>=.2*E));
+  const chainMarks=(badQ)=>c.j.map((id,q)=>({k:'j',id,txt:`${c.n[q]} ${(c.peaks[q].i/AF).toFixed(2)}초`,col:q===badQ?'#ff4d4f':null}));
+  if(c.bad>=0) add('bad','order',`${c.n[c.bad]}이(가) ${c.n[c.bad-1]}보다 먼저 나가요`,`(${c.n[c.bad]} ${(c.peaks[c.bad].i/AF).toFixed(2)}초 · ${c.n[c.bad-1]} ${(c.peaks[c.bad-1].i/AF).toFixed(2)}초)`,{t:c.peaks[c.bad].i/AF,marks:chainMarks(c.bad)});
+  else{
+    if(hand&&st>=1){ const fx=Math.min(st,3); add('warn','lower',`${c.n.slice(0,fx).join('·')}이(가) 거의 안 움직여요 (하체·허리를 안 써요)`,'',{marks:c.j.slice(0,fx).map((id,q)=>({k:'j',id,txt:c.n[q]+' 안 움직임'}))}); }
+    const pk=c.peaks.slice(st), amp=pk[0].v>1?E/pk[0].v:0;
+    if(amp>0&&amp<2.2&&pk.length>=3) add('warn','amp',`끝으로 갈수록 빨라지는 정도가 작아요 (${amp.toFixed(1)}배)`,'',{marks:chainMarks(-1)});
+    if(!(hand&&st>=1)&&amp>=2.2) add('ok','okorder',`힘이 순서대로 올라가며 끝에서 ${amp.toFixed(1)}배로 빨라져요`,'',{marks:chainMarks(-1)});
+  }
+  // 2) 끝 멈춤
+  if(hand){ const S=kin.spd[endId], pkv=S[iE]||1, j=Math.min(n-1,iE+Math.round(.15*AF)), r=S[j]/pkv;
+    if(r>.65) add('warn','stop','끝에서 멈추지 못하고 계속 흘러가요',`(0.15초 뒤에도 속도 ${Math.round(r*100)}% 유지)`,{t:j/AF,marks:[{k:'j',id:endId,txt:'아직 움직여요'}]});
+    else if(r<.3) add('ok','okstop','끝에서 "탁" 멈춰요','',{t:j/AF,marks:[{k:'j',id:endId,txt:'정지 좋아요'}]}); }
+  // 3) 지면반력
+  if(gb){
+    const a=Math.max(0,iE-Math.round(.6*AF));
+    let best=-1,bv=0; R(a,iE).forEach(k=>{const q=gb.f[k]; if(q&&(q.ft[0]||q.ft[1])&&Math.abs(q.tx)>bv){bv=Math.abs(q.tx);best=k}});
+    const q=best>=0?gb.f[best]:null;
+    if(q){ const ks=[0,1].filter(k=>q.ft[k]), tb=best/AF;
+      if(ks.length===2){ const fK=q.ft[0].x*d>q.ft[1].x*d?0:1, rK=1-fK, fh=q.ft[fK].fx*d, rh=q.ft[rK].fx*d;
+        if(bv<.12) add('warn','noground','땅을 앞뒤로 미는 힘이 거의 안 보여요','',{t:tb,marks:[{k:'foot',w:'both',txt:'땅 미는 힘 약해요'}]});
+        else{ if(rh<.12) add('warn','rear','뒷발이 앞으로 밀어주는 힘이 약해요',`(뒷발 ${rh.toFixed(2)}배)`,{t:tb,marks:[{k:'foot',w:'rear',txt:'여기서 더 밀어요'}]});
+              if(fh>-.08) add('warn','brake','앞발이 뒤로 버텨 주지 못해요',`(앞발 ${fh.toFixed(2)}배)`,{t:tb,marks:[{k:'foot',w:'front',txt:'여기서 버텨요'}]});
+              if(rh>=.12&&fh<=-.08) add('ok','okgrf','뒷발로 밀고 앞발로 버티는 흐름이 좋아요',`(뒷발 ${rh.toFixed(2)}배 · 앞발 ${fh.toFixed(2)}배)`,{t:tb,marks:[{k:'foot',w:'rear',txt:'밀어줌'},{k:'foot',w:'front',txt:'버팀'}]}); } }
+      else if(ks.length===1&&bv<.12&&hand) add('warn','noground','땅을 미는 힘이 거의 안 보여요','',{t:tb,marks:[{k:'foot',w:'both',txt:'땅 미는 힘 약해요'}]});
+    }
+    const a2=Math.max(0,iE-Math.round(.7*AF)), b2=Math.min(n-1,iE+Math.round(.5*AF));
+    let v0=null; R(a2,b2).some(k=>{ if(gb.pel[k]!=null){v0=gb.pel[k]*d;return true} });
+    if(v0!=null){ let mx=-1e9,mk=iE; R(a2,b2).forEach(k=>{ if(gb.pel[k]!=null&&gb.pel[k]*d>mx){mx=gb.pel[k]*d;mk=k} });
+      const fw=mx-v0; if(fw>.2*Math.max(.4,legLenAt(iE,P))) add('warn','pelvis',`허리가 앞으로 ${Math.round(fw*100)}cm나 쏠려요`,'',{t:mk/AF,marks:[{k:'j',id:33,txt:`허리 ${Math.round(fw*100)}cm 쏠림`}]}); }
+  }
+  // 4) 서기 자세
+  const iS=Math.max(0,iE-Math.round(.2*AF)), lg=legLenAt(iS,P);
+  const hL=P(iS,23),hR=P(iS,24),kL=P(iS,25),kR=P(iS,26),aL=P(iS,27),aR=P(iS,28),sL=P(iS,11),sR=P(iS,12);
+  const q0=gb&&gb.f[iS], both=q0&&q0.ft[0]&&q0.ft[1], tS=iS/AF;
+  if(both&&aL&&aR&&lg>0){ const wr=Math.abs(aL.x-aR.x)*mpp/lg;
+    if(wr<.45) add('warn','widthN',`서기 폭이 좁아요 (다리 길이의 ${Math.round(wr*100)}%)`,'',{t:tS,marks:[{k:'ank'}]});
+    else if(wr>1.5) add('warn','widthW',`서기 폭이 너무 넓어요 (다리 길이의 ${Math.round(wr*100)}%)`,'',{t:tS,marks:[{k:'ank'}]});
+    if(hL&&hR&&kL&&kR){ const a1=ang(hL,kL,aL).deg, a2=ang(hR,kR,aR).deg;
+      if(Math.min(a1,a2)>165) add('warn','knee',`두 무릎이 모두 거의 펴져 있어요 (${Math.round(a1)}°, ${Math.round(a2)}°)`,'',{t:tS,marks:[{k:'knee'}]}); } }
+  if(hL&&hR&&sL&&sR){ const dx=((sL.x+sR.x)-(hL.x+hR.x))/2, dy=-((sL.y+sR.y)-(hL.y+hR.y))/2, lean=Math.atan2(dx*d,dy)*180/Math.PI;
+    if(lean>18) add('warn','lean',`상체가 앞으로 ${Math.round(lean)}° 숙여져요`,'',{t:tS,marks:[{k:'lean'}]});
+    else if(lean<-12) add('warn','lean',`상체가 뒤로 ${Math.round(-lean)}° 젖혀져요`,'',{t:tS,marks:[{k:'lean'}]});
+    else add('ok','oklean','상체가 곧게 서 있어요','',{t:tS,marks:[{k:'lean'}]}); }
+  if(gb&&lg>0){ const k0=Math.max(0,iE-AF),k1=Math.min(n-1,Math.round(iE+.3*AF)), xs=[], path=[]; R(k0,k1).forEach(k=>{const q=gb.f[k]; if(q){xs.push(q.cx*W*mpp); path.push({x:q.cx,y:q.cy})}});
+    if(xs.length>5){ const sw=Math.max(...xs)-Math.min(...xs); if(sw>(hand?.45:.6)*lg) add('warn','sway',`무게중심이 ${Math.round(sw*100)}cm나 움직여요`,'',{t:iE/AF,marks:[{k:'com',path,txt:'무게중심 이동'}]}); } }
+  return {c,iE,kind,F,win:[Math.max(0,iE/AF-.6),Math.min(video.duration||1e9,iE/AF+.4)]};
+}
+function legLenAt(i,P){ let t=0,k=0; [[23,25,27],[24,26,28]].forEach(([h,m,a])=>{const H=P(i,h),M=P(i,m),A=P(i,a); if(H&&M&&A){t+=Math.hypot(H.x-M.x,H.y-M.y)+Math.hypot(M.x-A.x,M.y-A.y);k++}}); return k&&mpp?t/k*mpp:0; }
+const CATS=[['힘 전달',['order','lower','amp','okorder']],['끝 마무리',['stop','okstop']],['땅 밀기',['noground','rear','brake','pelvis','okgrf']],['서기·균형',['widthN','widthW','knee','lean','sway','oklean']]];
+function scoreCat(F,keys){ const fs=F.filter(f=>keys.includes(f.key)); if(!fs.length) return null;
+  const bad=fs.filter(f=>f.lv==='bad').length, warn=fs.filter(f=>f.lv==='warn').length;
+  if(bad) return 30; if(warn) return Math.max(35,60-10*(warn-1)); return 90; }
+function showCoach(){
+  const el=$('coachRep');
+  if(!kin||!track||!mpp){ el.innerHTML='<div class="sub">분석 결과가 없어요. 영상을 분석한 뒤 다시 눌러 주세요.</div>'; return; }
+  const evs=coachEvents();
+  if(!evs.length){ el.innerHTML='<div class="sub">센 동작을 찾지 못했어요. 지르기·막기·차기가 크게 나오는 영상으로 해 보세요.</div>'; return; }
+  coachRes=evs.map(diagEvent); cm=null;
+  const cnt={}, goods={};
+  coachRes.forEach(r=>r.F.forEach(f=>{ if(f.lv==='ok') goods[f.key]=f.title; else cnt[f.key]=(cnt[f.key]||{n:0,t:f.title}), cnt[f.key].n+=(f.lv==='bad'?2:1); }));
+  const top=Object.values(cnt).sort((a,b)=>b.n-a.n).slice(0,3), gd=Object.values(goods).slice(0,4);
+  const L={bad:'🔴',warn:'🟡',ok:'🟢'};
+  let html='<div class="fchip" style="cursor:default"><b>🔧 부족한 점</b><br>'+(top.length?top.map(x=>'· '+x.t).join('<br>'):'큰 약점은 안 보여요')+'<br><b>👍 잘된 점</b><br>'+(gd.length?gd.map(t=>'· '+t).join('<br>'):'아직 뚜렷한 장점이 안 보여요')+'</div>';
+  coachRes.forEach((r,ei)=>{
+    const bars=CATS.map(([nm,keys])=>{ const sc=scoreCat(r.F,keys); const col=sc==null?'#555':sc>=80?'#52e07a':sc>=50?'#ffc53d':'#ff4d4f';
+      return `<div style="display:flex;align-items:center;gap:6px;font-size:12px;margin:2px 0"><span style="width:62px">${nm}</span><span style="flex:1;height:8px;background:#222;border-radius:4px;overflow:hidden"><span style="display:block;height:100%;width:${sc==null?0:sc}%;background:${col}"></span></span><span style="width:26px;text-align:right;color:var(--sub)">${sc==null?'–':sc}</span></div>`; }).join('');
+    const body=r.F.length?r.F.map((f,fi)=>{ const info=COACH[f.key];
+      const btn=`<div style="margin:6px 0 2px"><button data-act="show" data-e="${ei}" data-f="${fi}">▶ 영상으로 확인</button> <button data-act="slow" data-e="${ei}" data-f="${fi}">🐢 느리게 보기</button></div>`;
+      const txt=info?`<b>왜 약해요?</b> ${info.why}<br><b>이렇게 연습해 보세요</b><br>${info.fix.map(t=>'· '+t).join('<br>')}`:'잘하고 있는 부분이에요. 영상에서 확인해 보세요.';
+      return `<details style="margin:4px 0"><summary>${L[f.lv]} <b>${f.title}</b> ${f.extra}</summary><div class="seq" style="margin-top:4px">${txt}${btn}</div></details>`;
+    }).join(''):'<div class="sub">이 동작에서 눈에 띄는 문제는 없어요.</div>';
+    html+=`<div class="fchip" style="cursor:default"><b>⏱ ${(r.iE/AFPS).toFixed(1)}초 · ${r.kind}</b> <button data-act="slow" data-e="${ei}" data-f="-1" style="padding:4px 8px;font-size:12px">🐢 동작 보기</button><div style="margin:6px 0">${bars}</div>${body}</div>`;
+  });
+  el.innerHTML='<div style="margin:4px 0"><button data-act="off">✕ 영상 표시 끄기</button></div>'+html+'<div class="sub">🔴 먼저 고칠 점 · 🟡 개선하면 좋은 점 · 🟢 잘하는 점. 막대는 이 동작의 항목별 점수예요. 제목을 누르면 이유·연습법이 펼쳐지고, [영상으로 확인]을 누르면 문제 부위가 영상 위에 표시돼요.</div>';
+}
+function stopClip(){ if(clipTimer){ clearInterval(clipTimer); clipTimer=null; video.pause(); video.playbackRate=parseFloat($('rate').value)||1; } }
+function playClip(t0,t1){
+  stopClip(); fz=null; video.pause();
+  const go=()=>{ video.removeEventListener('seeked',go); video.playbackRate=.25; video.play();
+    clipTimer=setInterval(()=>{ if(video.currentTime>=t1||video.paused||video.ended) stopClip(); },40); };
+  video.addEventListener('seeked',go); video.currentTime=Math.max(0,t0);
+}
+$('coachRep').onclick=e=>{
+  const b=e.target.closest('button[data-act]'); if(!b) return;
+  const act=b.dataset.act;
+  if(act==='off'){ stopClip(); cm=null; render(); return; }
+  const r=coachRes[+b.dataset.e]; if(!r) return; const f=r.F[+b.dataset.f];
+  stopClip(); fz=null;
+  if(f){ cm={marks:f.marks,col:f.lv==='ok'?'#52e07a':f.lv==='bad'?'#ff4d4f':'#ffc53d',key:f.key};
+    if(['noground','rear','brake','okgrf'].includes(f.key)){ $('grfOn').checked=true; refreshGrfRep(); }
+    if(['order','amp','lower','stop','okorder','okstop'].includes(f.key)){ $('forceOn').checked=true; $('forceSel').value=r.c.k; refreshForceRep(); }
+  } else cm=null;
+  $('cv').scrollIntoView({behavior:'smooth',block:'center'});
+  if(act==='show'&&f){ video.pause(); video.currentTime=Math.max(0,f.t); render(); }
+  else if(act==='slow'){ if(f&&f.t<r.win[0]) playClip(Math.max(0,f.t-.5),f.t+.4); else playClip(r.win[0],r.win[1]); }
+};
+function drawCoachMark(){
+  if(!cm||!pose||!track) return;
+  const W=cv.width,H=cv.height,s=sc(),d=gdir(),i=grfAt(), fr=gb&&gb.f[i];
+  const J=id=>{const q=vl(pose,id); return q&&q.visibility>.2?{x:q.x*W,y:q.y*H}:null};
+  let li=0;
+  const lab=(p,t,c)=>{ if(!t) return; const dy=-26*s-(li++%3)*15*s; ctx.save(); ctx.shadowBlur=0; ctx.font=`bold ${13*s}px sans-serif`; ctx.textAlign='center'; ctx.lineJoin='round'; ctx.lineWidth=4*s; ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.strokeText(t,p.x,p.y+dy); ctx.fillStyle=c; ctx.fillText(t,p.x,p.y+dy); ctx.restore(); };
+  const ring=(p,c,t)=>{ if(!p) return; ctx.save(); ctx.lineWidth=4*s; ctx.strokeStyle=c; ctx.shadowColor='rgba(0,0,0,.7)'; ctx.shadowBlur=6*s; ctx.beginPath(); ctx.arc(p.x,p.y,17*s,0,7); ctx.stroke(); ctx.restore(); lab(p,t,c); };
+  const line=(a,b,c,w)=>{ ctx.save(); ctx.strokeStyle=c; ctx.lineWidth=(w||5)*s; ctx.lineCap='round'; ctx.shadowColor='rgba(0,0,0,.7)'; ctx.shadowBlur=5*s; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.restore(); };
+  ctx.save();
+  cm.marks.forEach(m=>{
+    const c=m.col||cm.col;
+    if(m.k==='j') ring(J(m.id),c,m.txt);
+    else if(m.k==='foot'&&fr){ const fs=[0,1].filter(k=>fr.ft[k]).map(k=>fr.ft[k]).sort((a,b)=>b.x*d-a.x*d);
+      const pick=m.w==='both'?fs:m.w==='front'?fs.slice(0,1):fs.slice(-1);
+      if(fs.length===1&&m.w!=='both') fs.forEach(f=>ring({x:f.x*W,y:f.y*H},c,m.txt)); else pick.forEach(f=>ring({x:f.x*W,y:f.y*H},c,m.txt)); }
+    else if(m.k==='ank'){ const a=J(27),b=J(28); if(a&&b){ line(a,b,c,5); const cx=(a.x+b.x)/2,cy=(a.y+b.y)/2; lab({x:cx,y:cy+40*s},`발 간격 ${Math.round(Math.abs(a.x-b.x)/W*video.videoWidth*mpp*100)}cm`,c); } }
+    else if(m.k==='knee'){ [[23,25,27],[24,26,28]].forEach(([h,k,a])=>{ const H0=J(h),K=J(k),A=J(a); if(H0&&K&&A) ring(K,c,Math.round(ang(H0,K,A).deg)+'°'); }); }
+    else if(m.k==='lean'){ const a=J(11),b=J(12),h1=J(23),h2=J(24); if(a&&b&&h1&&h2){ const sh={x:(a.x+b.x)/2,y:(a.y+b.y)/2}, hp={x:(h1.x+h2.x)/2,y:(h1.y+h2.y)/2};
+        ctx.save(); ctx.setLineDash([8*s,8*s]); ctx.strokeStyle='rgba(255,255,255,.8)'; ctx.lineWidth=2*s; ctx.beginPath(); ctx.moveTo(hp.x,hp.y); ctx.lineTo(hp.x,hp.y-(hp.y-sh.y)*1.15); ctx.stroke(); ctx.restore();
+        line(hp,sh,c,6); const lean=Math.atan2((sh.x-hp.x)*d,-(sh.y-hp.y))*180/Math.PI; lab({x:sh.x,y:sh.y-8*s},`상체 ${lean>=0?'앞':'뒤'}로 ${Math.abs(Math.round(lean))}°`,c); } }
+    else if(m.k==='com'){ if(m.path&&m.path.length>1){ ctx.save(); ctx.strokeStyle=c; ctx.lineWidth=4*s; ctx.setLineDash([2*s,7*s]); ctx.lineCap='round'; ctx.beginPath(); m.path.forEach((p,q)=>q?ctx.lineTo(p.x*W,p.y*H):ctx.moveTo(p.x*W,p.y*H)); ctx.stroke(); ctx.restore(); }
+      if(fr) ring({x:fr.cx*W,y:fr.cy*H},c,m.txt); }
+  });
+  ctx.restore();
+}
+/* end coach */
 
 /* ---------- 사범 비교 (DTW 자동 박자 맞춤) ---------- */
 function angs(l,W,H){
@@ -1200,7 +1584,7 @@ let expCancelled=false, lastUrl=null;
 function pickMime(){return ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))}
 $('save').onclick=async()=>{
   if(!video.src||analyzing) return;
-  if(!anns.length&&!cmp&&!(track&&trailSel.size)&&!(kin&&$('forceOn').checked)){alert('먼저 영상에 그림·글자를 넣거나, 궤적/비교 분석을 켜 주세요.');return}
+  if(!anns.length&&!cmp&&!(track&&trailSel.size)&&!(kin&&$('forceOn').checked)&&!(gb&&$('grfOn').checked)){alert('먼저 영상에 그림·글자를 넣거나, 궤적/비교 분석을 켜 주세요.');return}
   const mime=pickMime(); if(!mime){alert('이 브라우저는 영상 저장을 지원하지 않아요. 최신 크롬/사파리를 사용해 주세요.');return}
   const busy=on=>{document.body.classList.toggle('busy',on);$('save').disabled=on;$('expCancel').hidden=!on};
   busy(true); fz=null; expCancelled=false; video.pause(); $('result').hidden=true;

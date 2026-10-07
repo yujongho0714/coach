@@ -143,7 +143,7 @@
   <div class="bar">
     <label class="chk"><input type="checkbox" id="stab" checked> 🎥 화면 흔들림 보정</label>
     <select id="qual">
-      <option value="auto" selected>정밀도: 자동</option><option value="lite">빠름</option>
+      <option value="auto" selected>정밀도: 최고 (기본)</option><option value="lite">빠름</option>
       <option value="full">정밀</option><option value="heavy">최고 정밀 (느림)</option>
     </select>
   </div>
@@ -286,16 +286,16 @@ async function makeLM(kind='lite',mode='VIDEO'){
   try{ return await PoseLandmarker.createFromOptions(fileset,opt('GPU')); }
   catch(e){ return PoseLandmarker.createFromOptions(fileset,opt('CPU')); }
 }
-function qualKind(d){const v=$('qual').value; return v!=='auto'?v:(d<=10?'heavy':'full');}
+function qualKind(d){const v=$('qual').value; return v!=='auto'?v:'heavy';}
 async function initPose(){
-  if(landmarker||loading||track) return;
-  loading=true; $('status').textContent='관절 인식 모델 불러오는 중…';
-  try{ landmarker=await makeLM('full'); $('status').textContent=''; }
+  if(landmarker||loading) return;
+  loading=true; $('status').textContent='최고 정밀 모델 불러오는 중… (처음 한 번 약 30MB)';
+  try{ landmarker=await makeLM('heavy'); $('status').textContent=''; }
   catch(err){ $('status').textContent='모델 로딩 실패(인터넷 연결 확인)'; poseOn=false; $('poseBtn').classList.remove('on'); }
   loading=false; detect(); render();
 }
 function detect(){
-  if(track){ pose=poseAt(track,video.currentTime); return; }
+  if(track){ pose=poseAt(track,vtime()); if(pose||!poseOn) return; if(!landmarker){ initPose(); return; } }
   if(!poseOn||!landmarker||video.readyState<2||analyzing) return;
   if(pose&&lastDetT===vtime()) return; lastDetT=vtime();
   const ts=Math.max(lastTs+1,performance.now()); lastTs=ts;
@@ -304,8 +304,10 @@ function detect(){
 $('poseBtn').onclick=()=>{
   poseOn=!poseOn; $('poseBtn').classList.toggle('on',poseOn);
   if(poseOn){
-    if(!track&&video.src&&video.duration<=20){ busyRun(()=>analyzeStudent()); } // 짧은 영상은 바로 정밀 분석
-    else if(!track){ initPose(); $('hint').textContent='💡 지금은 빠른 실시간 표시예요. [⚡ 동작 정밀 분석]을 누르면 선이 훨씬 안정되고 정확해져요.'; }
+    if(!track&&video.src){
+      if(video.duration<=20) busyRun(()=>analyzeStudent());
+      else { const a=Math.max(0,video.currentTime-1), b=Math.min(video.duration,a+16); busyRun(()=>analyzeStudent(0,1,{a,b})); }
+    }
     detect();
   } else if(!track) pose=null;
   render();
@@ -794,17 +796,19 @@ function seekTo(el,t){
     el.addEventListener('seeked',f); el.currentTime=t; setTimeout(f,1500);});
 }
 function setAna(txt,p){$('anaTxt').textContent=txt; if(p!=null)$('anaBar').style.width=Math.round(p*100)+'%'}
-async function analyze(el,name,p0,p1,cam){
+async function analyze(el,name,p0,p1,cam,rng){
   const d=el.duration; if(!isFinite(d)||!d) throw new Error('영상 길이를 읽을 수 없어요');
   const kind=qualKind(d);
   setAna(`${name} 준비 중… (${QN[kind]} 모델 불러오는 중)`,p0);
   const lm=await makeLM(kind), out=[], n=Math.floor(d*AFPS)+1, offs=[];
   const lmImg=await makeLM(kind,'IMAGE').catch(()=>null);
   let pg=null,pb=null,o={x:0,y:0};
+  const i0=rng?Math.max(0,Math.floor(rng.a*AFPS)):0, i1=rng?Math.min(n-1,Math.ceil(rng.b*AFPS)):n-1;
   try{
     for(let i=0;i<n;i++){
       if(anaCancel) return null;
       const t=Math.min(d-0.001,i/AFPS);
+      if(i<i0||i>i1){ out.push({t,lm:null,cands:[]}); if(cam) offs.push({x:o.x,y:o.y}); continue; }
       await seekTo(el,t);
       let r=null; try{ r=lm.detectForVideo(el,i*(1000/AFPS)+1).landmarks[0]||null; }catch(e){}
       const cands=[];
@@ -819,7 +823,7 @@ async function analyze(el,name,p0,p1,cam){
           pg=G; pb=bx; }
         offs.push({x:o.x,y:o.y});
       }
-      if(i%2===0) setAna(`${name} 분석 중 ${Math.round(i/n*100)}% · ${QN[kind]}`,p0+(p1-p0)*i/n);
+      if(i%2===0){ const q=(i-i0)/Math.max(1,i1-i0); setAna(`${name} 분석 중 ${Math.round(q*100)}% · ${QN[kind]}`,p0+(p1-p0)*q); }
     }
   }finally{ try{lm.close()}catch(e){} try{lmImg&&lmImg.close()}catch(e){} }
   out.rotPick=pickBest(out,el.videoWidth,el.videoHeight);
@@ -881,15 +885,15 @@ async function busyRun(fn){
   }
 }
 $('anaCancel').onclick=()=>{anaCancel=true; setAna('취소하는 중…')};
-async function analyzeStudent(p0=0,p1=1){
-  if(video.duration>120&&!confirm('영상이 길어서 분석에 몇 분 걸릴 수 있어요. 계속할까요?')){anaCancel=true;return}
+async function analyzeStudent(p0=0,p1=1,rng=null){
+  if(!rng&&video.duration>120&&!confirm('영상이 길어서 분석에 몇 분 걸릴 수 있어요. 계속할까요?')){anaCancel=true;return}
   const fps=video.duration<=20?30:20;
   if(tTrack&&tTrack.fps!==fps){tTrack=null;cmp=null}
   AFPS=fps;
-  const tr=await analyze(video,'원생 영상',p0,p1,true); if(!tr) return;
+  const tr=await analyze(video,'원생 영상',p0,p1,true,rng); if(!tr) return;
   trackRaw=tr; trackClean=cleanTrack(tr,video.videoWidth,video.videoHeight); computeCorr(tr.cam); rebuildTrack();
   const mx=corr?Math.max(0,...corr.map(c=>Math.hypot(c.x,c.y))):0;
-  $('stabInfo').textContent=`✔ 관절 튐 ${trackClean.fixed}곳 바로잡음 · `+(mx>3?`화면 흔들림 최대 ${Math.round(mx)}px 보정`:'화면 흔들림 거의 없음')+(tr.rotPick?` · 기울어진 자세 ${tr.rotPick}장면 다시 인식`:'')+` · ${QN[tr.kind]} 모델`;
+  $('stabInfo').textContent=`✔ 관절 튐 ${trackClean.fixed}곳 바로잡음 · `+(mx>3?`화면 흔들림 최대 ${Math.round(mx)}px 보정`:'화면 흔들림 거의 없음')+(tr.rotPick?` · 기울어진 자세 ${tr.rotPick}장면 다시 인식`:'')+` · ${QN[tr.kind]} 모델`+(rng?` · ${rng.a.toFixed(0)}~${rng.b.toFixed(0)}초 구간 (다른 구간은 그 위치에서 관절 표시를 껐다 켜기)`:'');
 }
 $('anaBtn').onclick=()=>{
   if(!video.src){alert('먼저 영상을 불러오세요.');return}
